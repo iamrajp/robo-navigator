@@ -1,0 +1,25 @@
+[project]
+name = "lidarexp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gpiozero>=2.0.1.post3",
+    "ipygame>=1.0.1",
+    "lgpio>=0.2.2.0",
+    "matplotlib>=3.11.2",
+    "open3d>=0.20.0",
+    "pygame>=2.6.1",
+    "pyrplidar>=0.1.2",
+    "requests>=2.34.2",
+    "rplidar-roboticia>=0.9.5",
+    "scipy>=1.17.1",
+]
+
+[project.scripts]
+lidarexp = "lidarexp:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
