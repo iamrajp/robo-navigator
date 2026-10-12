@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=1.13.0",
+    "gh>=0.0.4",
     "gpiozero>=2.0.1.post3",
     "ipygame>=1.0.1",
     "lgpio>=0.2.2.0",

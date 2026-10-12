@@ -923,26 +923,40 @@ def set_zones_list(new):
     zones = new
 
 
+def store_pin(entry, frame):
+    """Save a photo pin (metadata + jpeg) next to the currently loaded map."""
+    os.makedirs(photos_base[0] + ".photos", exist_ok=True)
+    with open(photo_file(entry["id"]), "wb") as f:
+        f.write(frame)
+    photos.append({k: v for k, v in entry.items() if k != "frame"})
+    save_photos()
+
+
 class Explorer:
-    """Frontier exploration while mapping: drive to the nearest unexplored edge, look again, repeat.
+    """Drives to unexplored edges while mapping (frontier exploration), or - with an LLM brain attached -
+    lets the LLM choose the next leg (explore / go / look / pin / no-go) in mapping or navigation mode.
     Floor that looks like it ends (camera) becomes a no-go box and is never driven into."""
 
     def __init__(self):
         self.on = False
         self.occ = None
         self.zones = []              # no-go boxes drawn automatically; they become the new map's zones on save
+        self.pins = []               # photo pins taken while mapping (written with the map on save)
         self.target = None
         self.bad = []                # frontier spots that failed
         self.trail = []              # places the car has stopped and looked from
         self.prev_gm = None
         self.radius = 5.0
         self.hazards = 0
+        self.fails = 0
+        self.brain, self.task, self.ai_log, self.ai_n, self.finished = None, "", [], 0, None
 
     def reset(self):
-        self.occ, self.zones, self.bad, self.trail, self.target, self.hazards = None, [], [], [], None, 0
+        self.occ, self.zones, self.pins, self.bad, self.trail, self.target, self.hazards = None, [], [], [], [], None, 0
 
-    def start(self, radius):
-        self.radius, self.on = radius, True
+    def start(self, radius, brain=None, task=""):
+        self.radius, self.on, self.brain, self.task = radius, True, brain, task
+        self.ai_log, self.ai_n, self.finished, self.fails = [], 0, None, 0
         threading.Thread(target=self.run, daemon=True).start()
 
     def hazard_now(self):
@@ -958,12 +972,23 @@ class Explorer:
             return True
         return False
 
+    def add_zone(self, pts, note):
+        """A no-go polygon: kept with the map being built, or applied straight away on a loaded map."""
+        global gm
+        pts = [[float(x), float(y)] for x, y in pts]
+        if loc.mode == "map":
+            self.zones.append({"id": max([z["id"] for z in self.zones] + [0]) + 1, "pts": pts, "auto": note})
+        else:
+            zones.append({"id": max([z["id"] for z in zones] + [0]) + 1, "pts": pts, "auto": note})
+            gm.set_zones([z["pts"] for z in zones])
+            save_zones()
+
     def add_hazard_zone(self):
         x, y, yaw, _ = loc.pose()
         h = nav.heading(yaw)
         u, v = (math.cos(h), math.sin(h)), (-math.sin(h), math.cos(h))
         pts = [[x + u[0] * f + v[0] * w, y + u[1] * f + v[1] * w] for f, w in ((0.15, -0.3), (0.85, -0.3), (0.85, 0.3), (0.15, 0.3))]
-        self.zones.append({"id": max([z["id"] for z in self.zones] + [0]) + 1, "pts": pts, "auto": "ledge?"})
+        self.add_zone(pts, "ledge?")
         self.hazards += 1
         if camera and camera.frame:                       # keep the frame so you can judge it afterwards
             os.makedirs("explore_hazards", exist_ok=True)
@@ -971,78 +996,208 @@ class Explorer:
                 f.write(camera.frame)
         log(f"[explore] no-go box added ahead of ({x:.2f},{y:.2f}) - possible ledge ({self.hazards})")
 
-    def pick(self, g, car_xy):
-        """Nearest reachable frontier -> (target, path) or (None, None)."""
-        cands = []
+    def candidates(self, g, car_xy):
+        """Reachable, not-yet-seen frontiers as [(dist, size, cell, path)], nearest first."""
+        raw = []
         for size, c in g.frontiers(self.radius):
             if any(math.dist(c, b) < BAD_TARGET_R for b in self.bad):
                 continue
             if any(math.dist(c, t) < SEEN_R for t in self.trail):     # already been (and looked) there
                 continue
-            cands.append((math.dist(c, car_xy) - 0.02 * min(size, 30), c))
-        cands.sort()
-        for _, c in cands[:6]:
+            raw.append((math.dist(c, car_xy) - 0.02 * min(size, 30), size, c))
+        raw.sort()
+        out = []
+        for _, size, c in raw[:8]:
             path = g.plan(car_xy, c)
             if path and len(path) >= 2:
-                return c, path
-            self.bad.append(c)                           # unreachable from here
-        return None, None
+                out.append((sum(math.dist(p, q) for p, q in zip(path, path[1:])), size, c, path))
+        return out
+
+    def drive_leg(self, target, path):
+        """Run one short leg. None = fine, otherwise a sentence about what went wrong."""
+        leg = ex.truncate(path, EXPLORE_LEG)
+        state["path"], state["wp"] = leg, 1
+        try:
+            nav.go(leg)
+            self.fails = 0
+            return None
+        except Hazard:
+            self.add_hazard_zone()
+            self.bad.append(target)
+            nav.back_off(0.35)                  # step away from the edge, then choose another target
+            if self.hazards >= MAX_HAZARDS:
+                raise RuntimeError(f"{self.hazards} possible ledges found - stopping, please check the car")
+            return "the camera ledge check stopped the car; a no-go box was added ahead of it"
+        except RuntimeError as e:
+            log(f"[explore] leg failed: {e}")
+            self.bad.append(target)
+            self.fails += 1
+            nav.back_off()                      # reverse (or turn away), then try a different target
+            if self.fails >= EXPLORE_FAILS:
+                raise RuntimeError(f"stuck - {self.fails} targets in a row failed ({e})")
+            return f"the leg failed ({e}); the car backed off"
+
+    # ── AI decision step ──
+    def ai_step(self, g, car_xy, yaw, cands):
+        """Ask the LLM what to do next and carry it out. Returns False when the run should end."""
+        import llm_brain
+        nav_mode = loc.mode != "map"
+        h = nav.heading(yaw)
+        cells = g.grid.copy()
+        cells[g.occ_raw] = 3
+        zl = zones if nav_mode else self.zones
+        pins = photos if nav_mode else self.pins
+        fr = [(i + 1, c[2]) for i, c in enumerate(cands)]
+        png = llm_brain.render_map(cells, g.min, car_xy, h, fr, [z["pts"] for z in zl],
+                                   [(p["id"], (p["x"], p["y"])) for p in pins], self.trail[-60:])
+        lines = [f"Robot at ({car_xy[0]:.2f}, {car_xy[1]:.2f}) m, facing {math.degrees(wrap(h)):.0f} deg (0 = +x, 90 = +y).",
+                 f"No-go boxes: {len(zl)}. Ledge alarms this run: {self.hazards}.",
+                 f"Decisions used: {self.brain.decisions}/{llm_brain.MAX_DECISIONS}."]
+        if pins:
+            lines.append("Photo pins: " + "; ".join(f"{p['id']}={p.get('note') or 'photo'} at ({p['x']:.1f},{p['y']:.1f})" for p in pins[-12:]))
+        if nav_mode:
+            lines.append("Mode: navigating a finished map (no exploration).")
+        elif cands:
+            lines.append("Frontiers (route length m, size): " + "; ".join(
+                f"F{i + 1} at ({c[2][0]:.1f},{c[2][1]:.1f}) {c[0]:.1f} m, {c[1]} cells" for i, c in enumerate(cands)))
+        else:
+            lines.append("There are no reachable frontiers left.")
+        allowed = {"go_to", "turn_to", "pin_photo", "add_no_go", "finish"} | (set() if nav_mode else {"explore_to"})
+        try:
+            name, args = self.brain.decide(self.task, png, camera.frame if camera else None, "\n".join(lines), allowed)
+        except llm_brain.DecisionLimit:
+            raise
+        except llm_brain.BrainError as e:
+            if nav_mode:
+                raise RuntimeError(f"AI unavailable: {e}")
+            log(f"[ai] {e} - using the built-in explorer for this step")
+            self.ai_log.append(f"AI error ({e}) - built-in explorer used")
+            return self.heuristic_step(cands)
+        why = args.get("reason") or args.get("note") or args.get("summary") or ""
+        res = self.execute(name, args, g, car_xy, yaw, cands)
+        self.brain.note_result(f"{self.brain.decisions}. {name}({json.dumps(args)[:120]}) -> {res}")
+        self.ai_log.append(f"#{self.brain.decisions} {name}: {why} -> {res}")
+        self.ai_n += 1
+        del self.ai_log[:-40]
+        state["msg"] = f"AI: {why}" if why else f"AI: {name}"
+        return name != "finish"
+
+    def execute(self, name, args, g, car_xy, yaw, cands):
+        global gm
+        try:
+            if name == "explore_to":
+                i = int(args["frontier_id"]) - 1
+                if not 0 <= i < len(cands):
+                    return f"error: there is no frontier F{i + 1}"
+                _, _, c, path = cands[i]
+                self.target = c
+                return self.drive_leg(c, path) or f"ok, drove toward F{i + 1}"
+            if name == "go_to":
+                tgt = (float(args["x"]), float(args["y"]))
+                cx, cy = g.to_cell(*tgt)
+                if not g.inside(cx, cy) or g.grid[cy, cx] != 0 or g.blocked[cy, cx]:
+                    return "error: that point is not known free floor (unknown, wall margin or no-go)"
+                path = g.plan(car_xy, tgt)
+                if not path or len(path) < 2:
+                    return "error: no path there"
+                self.target = tgt
+                return self.drive_leg(tgt, path) or "ok, drove toward the point"
+            if name == "turn_to":
+                goal = math.radians(float(args["heading_deg"]))
+                for _ in range(14):
+                    if state["stop"]:
+                        break
+                    _, _, yw, _ = loc.wait_scans()
+                    err = wrap(goal - nav.heading(yw))
+                    if abs(err) < AIM_TOL:
+                        break
+                    nav.turn_step(err, yw)
+                loc.hold_until = time.time() + SETTLE_S
+                return "ok, turned"
+            if name == "pin_photo":
+                fr = camera.frame if camera else None
+                if fr is None:
+                    return "error: camera not available"
+                pool = self.pins if loc.mode == "map" else photos
+                entry = {"id": max([p["id"] for p in pool] + [0]) + 1, "x": float(car_xy[0]), "y": float(car_xy[1]),
+                         "yaw": float(nav.heading(yaw)), "t": time.strftime("%H:%M:%S %d %b"), "note": str(args.get("note", ""))[:80]}
+                if loc.mode == "map":
+                    self.pins.append({**entry, "frame": fr})
+                else:
+                    store_pin(entry, fr)
+                return "ok, photo pinned"
+            if name == "add_no_go":
+                x, y, w, h = (float(args[k]) for k in ("x", "y", "w", "h"))
+                if not (0.2 <= w <= 3.0 and 0.2 <= h <= 3.0):
+                    return "error: box sides must be 0.2 to 3 m"
+                if abs(car_xy[0] - x) < w / 2 + 0.1 and abs(car_xy[1] - y) < h / 2 + 0.1:
+                    return "error: the box would contain the robot; place it ahead of the robot instead"
+                self.add_zone([(x - w / 2, y - h / 2), (x + w / 2, y - h / 2), (x + w / 2, y + h / 2), (x - w / 2, y + h / 2)],
+                              "ai: " + str(args.get("reason", ""))[:60])
+                return "ok, no-go box added"
+            if name == "finish":
+                self.finished = str(args.get("summary", ""))
+                return "finished"
+            return f"error: unknown tool {name}"
+        except (KeyError, ValueError, TypeError) as e:
+            return f"error: bad arguments ({e})"
+
+    def heuristic_step(self, cands):
+        """Built-in explorer: nearest reachable frontier. Returns False when none is left."""
+        if not cands:
+            self.target = None
+            state["msg"] = "Exploration complete - name the map and press Save & navigate"
+            log("[explore] no reachable frontier left - done")
+            return False
+        _, _, c, path = cands[0]
+        self.target = c
+        state["msg"] = f"Exploring - heading to ({c[0]:.1f}, {c[1]:.1f})"
+        self.drive_leg(c, path)
+        return True
 
     def run(self):
         global gm
-        fails = 0
+        nav_mode = loc.mode != "map"
         state["moving"], state["stop"] = True, False
         nav.hazard_check = self.hazard_now
-        loc.strict = True
+        loc.strict = not nav_mode
         old_move_t, old_max_turn = nav.move_t, nav.max_turn
         nav.move_t, nav.max_turn = EXPLORE_MOVE_T, EXPLORE_TURN_T
         try:
             if nav.fwd_off is None:
                 state["msg"] = "Calibrating…"
                 nav.calibrate_forward()
-            if self.occ is None:
+            if not nav_mode and self.occ is None:
                 self.occ = ex.Occupancy()
             while not state["stop"]:
                 if loc.bad >= LOST_SCANS and not nav.wait_tracking():
                     raise RuntimeError("lost my position")
                 x, y, yaw, _ = loc.wait_scans(2)             # the car is stopped here
-                P = loc.live_points()
-                with loc.lock:
-                    T = loc.T.copy()
-                self.occ.update((x, y), P @ T[:2, :2].T + T[:2, 3])
                 if not self.trail or math.dist(self.trail[-1], (x, y)) > 0.3:
                     self.trail.append((x, y))
-                gm = ex.ExploreGrid(self.occ, [z["pts"] for z in self.zones], gm_radius + EXPLORE_CLEARANCE, (x, y))
-                target, path = self.pick(gm, (x, y))
-                self.target = target
-                if target is None:
-                    state["msg"] = "Exploration complete - name the map and press Save & navigate"
-                    log("[explore] no reachable frontier left - done")
+                if nav_mode:
+                    g, cands = gm, []
+                else:
+                    P = loc.live_points()
+                    with loc.lock:
+                        T = loc.T.copy()
+                    self.occ.update((x, y), P @ T[:2, :2].T + T[:2, 3])
+                    gm = g = ex.ExploreGrid(self.occ, [z["pts"] for z in self.zones], gm_radius + EXPLORE_CLEARANCE, (x, y))
+                    cands = self.candidates(g, (x, y))
+                if self.brain:
+                    state["msg"] = "AI is thinking…"
+                    keep_going = self.ai_step(g, (x, y), yaw, cands)
+                else:
+                    keep_going = self.heuristic_step(cands)
+                self.target = None if not keep_going else self.target
+                if not keep_going:
+                    if self.finished is not None:
+                        state["msg"] = "AI finished: " + self.finished
                     break
-                leg = ex.truncate(path, EXPLORE_LEG)
-                path[:] = leg
-                state["path"], state["wp"] = leg, 1
-                state["msg"] = f"Exploring - heading to ({target[0]:.1f}, {target[1]:.1f})"
-                try:
-                    nav.go(leg)
-                    fails = 0
-                except Hazard:
-                    self.add_hazard_zone()
-                    self.bad.append(target)
-                    nav.back_off(0.35)                  # step away from the edge, then choose another target
-                    if self.hazards >= MAX_HAZARDS:
-                        raise RuntimeError(f"{self.hazards} possible ledges found - stopping, please check the car")
-                except RuntimeError as e:
-                    log(f"[explore] leg failed: {e}")
-                    self.bad.append(target)
-                    fails += 1
-                    nav.back_off()                      # reverse (or turn away), then try a different target
-                    if fails >= EXPLORE_FAILS:
-                        raise RuntimeError(f"stuck - {fails} targets in a row failed ({e})")
             else:
-                state["msg"] = "Exploration stopped"
+                state["msg"] = "Stopped"
         except Exception as e:
-            state["msg"] = f"Exploration stopped: {e}"
+            state["msg"] = f"Stopped: {e}"
             log(f"[explore] aborted: {e!r}")
         finally:
             nav.hazard_check = None
@@ -1053,6 +1208,99 @@ class Explorer:
 
 
 explorer = Explorer()
+
+
+chat = None
+chat_lock = threading.Lock()
+
+
+def chat_turn(text, on_text=None):
+    """One chat turn (shared by the web page and Telegram): -> (reply, actions)."""
+    global chat
+    import llm_brain
+    with chat_lock:
+        if chat is None:
+            chat = llm_brain.Chat(log)
+        status, png, cam = chat_context()
+        actions = []
+        reply = chat.reply(text, png, cam, status, lambda n, a: chat_tool(n, a, actions), on_text=on_text)
+    return reply, actions
+
+
+def ai_start(task, radius=5.0):
+    """Start an AI run. -> (ok, error)."""
+    if not car or not loc:
+        return False, "AI control needs the real car"
+    if state["moving"]:
+        return False, "Already busy"
+    if loc.mode == "nav" and loc.bad >= LOST_SCANS:
+        return False, "Localisation is lost - put the car where it can see walls first"
+    try:
+        import llm_brain
+        brain = llm_brain.Brain(log)
+    except Exception as e:
+        return False, f"Cannot start the AI: {e} (set ANTHROPIC_API_KEY before starting the server)"
+    explorer.start(max(1.0, min(12.0, float(radius))), brain, str(task)[:500])
+    return True, ""
+
+
+def robot_stop():
+    state["stop"] = True
+    if car:
+        car.send("S")
+
+
+def chat_context():
+    """Status text, map image (or None) and camera frame for a chat turn."""
+    pose, yaw = cur_pose()
+    h = nav.heading(yaw) if loc else yaw
+    mode = "mapping a new map" if loc and loc.mode == "map" else "navigating a saved map"
+    st_ = [f"Mode: {mode}. Robot at ({pose[0]:.2f}, {pose[1]:.2f}) m facing {math.degrees(wrap(h)):.0f} deg (0 = +x, 90 = +y).",
+           f"Robot is {'moving (' + state['msg'] + ')' if state['moving'] else 'stopped'}.",
+           f"Localisation: {'LOST' if state['lost'] else 'ok'}."]
+    png = None
+    mapping = loc and loc.mode == "map"
+    zl = explorer.zones if mapping else zones
+    pins = explorer.pins if mapping else photos
+    st_.append(f"No-go boxes: {len(zl)}. Photo pins: " + ("; ".join(f"{p['id']}={p.get('note') or 'photo'} at ({p['x']:.1f},{p['y']:.1f})" for p in pins[-10:]) or "none") + ".")
+    if gm is not None and (not mapping or explorer.occ is not None):
+        try:
+            import llm_brain
+            cells = gm.grid.copy()
+            cells[gm.occ_raw] = 3
+            png = llm_brain.render_map(cells, gm.min, pose, h, (), [z["pts"] for z in zl],
+                                       [(p["id"], (p["x"], p["y"])) for p in pins], explorer.trail[-60:] if mapping else ())
+        except Exception as e:
+            log(f"[chat] map render failed: {e!r}")
+    return "\n".join(st_), png, (camera.frame if camera else None)
+
+
+def chat_tool(name, args, actions):
+    pose, yaw = cur_pose()
+    if name == "propose_task":
+        actions.append({"type": "propose", "task": str(args.get("task", ""))[:500]})
+        return "Shown to the owner with a Start button; the robot will not move until they press it."
+    if name == "stop_robot":
+        state["stop"] = True
+        if car:
+            car.send("S")
+        actions.append({"type": "stopped"})
+        return "Stopped."
+    if name == "pin_photo":
+        fr = camera.frame if camera else None
+        if fr is None or not loc:
+            return "error: camera not available"
+        mapping = loc.mode == "map"
+        pool = explorer.pins if mapping else photos
+        entry = {"id": max([p["id"] for p in pool] + [0]) + 1, "x": float(pose[0]), "y": float(pose[1]), "yaw": float(nav.heading(yaw)),
+                 "t": time.strftime("%H:%M:%S %d %b"), "note": str(args.get("note", ""))[:80]}
+        if mapping:
+            explorer.pins.append({**entry, "frame": fr})
+        else:
+            store_pin(entry, fr)
+        actions.append({"type": "pinned", "note": entry["note"]})
+        return "Photo pinned."
+    return "error: unknown tool"
 
 
 def cur_pose():
@@ -1118,7 +1366,9 @@ class H(BaseHTTPRequestHandler):
                         "target": explorer.target})
         elif self.path == "/state":
             pose, yaw = cur_pose()
-            self._send({"explore": explorer.on, "learn": loc.learn if loc else False,
+            self._send({"explore": explorer.on, "ai": {"on": bool(explorer.on and explorer.brain), "log": explorer.ai_log[-8:], "n": explorer.ai_n,
+                        "tokens": [explorer.brain.tokens_in, explorer.brain.tokens_out, explorer.brain.tokens_cached] if explorer.brain else [0, 0, 0]},
+                        "learn": loc.learn if loc else False,
                         "added": loc.added if loc else 0, "removed": loc.removed if loc else 0,
                         "map_version": grid_ver[0], "pose": pose, "yaw": nav.heading(yaw) if loc else yaw, "path": state["path"],
                         "moving": state["moving"], "arrived": state["arrived"], "mode": loc.mode if loc else "nav", "msg": state["msg"], "lost": state["lost"]})
@@ -1212,7 +1462,7 @@ class H(BaseHTTPRequestHandler):
             with open(photo_file(pid), "wb") as f:
                 f.write(frame)
             photos.append({"id": pid, "x": float(pose[0]), "y": float(pose[1]), "yaw": float(nav.heading(yaw)),
-                           "t": time.strftime("%H:%M:%S %d %b")})
+                           "t": time.strftime("%H:%M:%S %d %b"), "note": str(data.get("note", ""))[:80]})
             save_photos()
             self._send({"ok": True, "photos": photos})
         elif self.path == "/explore":
@@ -1226,6 +1476,42 @@ class H(BaseHTTPRequestHandler):
                 state["stop"] = True
                 car.send("S")
             self._send({"ok": True})
+        elif self.path == "/chat":
+            global chat
+            if data.get("reset"):
+                if chat:
+                    chat.reset()
+                return self._send({"ok": True})
+            text = str(data.get("message", "")).strip()[:2000]
+            if not text:
+                return self._send({"ok": False, "error": "Empty message"})
+            # streamed reply: one JSON object per line, text deltas first, then a final {"done": true, ...}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def emit(obj):
+                self.wfile.write((json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+            try:
+                _, actions = chat_turn(text, on_text=lambda d: emit({"t": d}))
+                emit({"done": True, "actions": actions})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                hint = " (set ANTHROPIC_API_KEY before starting the server)" if "api_key" in str(e).lower() or "auth" in str(e).lower() else ""
+                try:
+                    emit({"error": f"{e}{hint}"})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        elif self.path == "/ai":
+            if not data.get("on"):
+                robot_stop()
+                return self._send({"ok": True})
+            ok, err = ai_start(data.get("task", ""), data.get("radius", 5.0))
+            self._send({"ok": ok, "error": err})
         elif self.path == "/learn":
             if loc:
                 loc.learn = bool(data.get("on"))
@@ -1308,6 +1594,8 @@ class H(BaseHTTPRequestHandler):
                     set_zones_list(list(explorer.zones))
                     zones_file[0] = zones_path(path)
                     save_zones()
+                for pin in explorer.pins:         # ...and the photos pinned during the run
+                    store_pin(pin, pin["frame"])
                 new = build_gm(path)
                 loc.set_map(path)                 # switches back to navigation
             except Exception as e:
@@ -1315,7 +1603,7 @@ class H(BaseHTTPRequestHandler):
                     os.remove(path)               # no half-saved map blocking a retry
                 return self._send({"ok": False, "error": "Save failed: " + str(e)})
             gm = new
-            explorer.prev_gm, explorer.zones = None, []
+            explorer.prev_gm, explorer.zones, explorer.pins = None, [], []
             state["path"] = []
             current_map[0] = path
             self._send({"ok": True, "file": path})
@@ -1354,6 +1642,15 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
  .chip i{cursor:pointer;font-style:normal;background:#8b2c31;border-radius:50%;width:18px;height:18px;text-align:center;line-height:18px}
  #maps{padding:8px;border-radius:6px;border:0;background:#3b4252;color:#fff;font-size:14px;max-width:210px}
  #mode{background:#a5521f}
+ #chatbtn{position:fixed;left:16px;bottom:16px;z-index:5;background:#7048e8;border-radius:24px;padding:12px 18px;box-shadow:0 2px 10px #0008}
+ #chat{display:none;position:fixed;left:16px;bottom:70px;width:min(400px,calc(100vw - 32px));height:min(60vh,520px);z-index:6;background:#1b2028;border:1px solid #2e3644;border-radius:12px;flex-direction:column;box-shadow:0 4px 24px #000a}
+ #chat header{padding:8px 12px;border-radius:12px 12px 0 0;font-size:14px}#chat header button{padding:3px 10px;font-size:12px;background:#3b4252}
+ #chatlog{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
+ .m{max-width:88%;padding:8px 11px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word;font-size:14px;line-height:1.35}
+ .m.u{align-self:flex-end;background:#3b5bdb}.m.a{align-self:flex-start;background:#2b3241}.m.s{align-self:center;background:none;color:#9aa4b2;font-size:12px}
+ .m button{margin-top:6px;background:#1f9d55;padding:6px 12px;font-size:13px}
+ #chatform{display:flex;gap:6px;padding:8px;border-top:1px solid #2e3644}
+ #chatin{flex:1;padding:9px;border-radius:8px;border:0;background:#12151a;color:#e6e8eb;font-size:14px}
  #pad{display:none;position:fixed;right:18px;bottom:18px;grid-template-columns:repeat(3,64px);gap:6px}
  #pad button{height:56px;background:#3b4252;font-size:20px;padding:0}
  #savebar{display:none;gap:8px;align-items:center}
@@ -1376,12 +1673,21 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <div id="zbar"><button id="ztbox" class="tool on">▭ Box</button><button id="ztpoly" class="tool">⬠ Polygon</button>
  <span id="zhint">Drag on the map to draw a box the car must NOT enter.</span>
  <button id="zclose" style="display:none">Close zone</button><button id="zundo" style="display:none">Undo corner</button><span id="zlist"></span></div>
+<div id="aibar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;background:#1d2433">
+ <button id="aibtn" style="background:#7048e8">🧠 AI</button>
+ <input id="aitask" placeholder="Task for the AI, e.g. map the living room first, skip the garage, pin a photo in each room" style="flex:1;min-width:260px;padding:8px;border-radius:6px;border:0">
+ <span id="aistat" style="color:#9aa4b2;font-size:13px"></span></div>
+<div id="ailog" style="display:none;padding:6px 14px;background:#161b27;color:#b8c1d1;font-size:13px;max-height:110px;overflow:auto;white-space:pre-wrap"></div>
 <div id="savebar" style="padding:6px 14px;background:#1b2028"><button id="explore" style="background:#1c7ed6">🧭 Auto-explore</button>
  <label style="color:#9aa4b2">radius <input id="xr" type="number" min="1" max="12" step="0.5" value="5" style="width:56px;padding:6px;border-radius:6px;border:0"> m</label>
  <span>…or drive the car around every room yourself, then:</span>
  <input id="mname" placeholder="map name" value="my_map"><button id="savebtn">Save &amp; navigate</button></div>
 <div id="pad"><span></span><button data-d="F">▲</button><span></span><button data-d="L">◀</button><button data-d="S">■</button><button data-d="R">▶</button><span></span><button data-d="B">▼</button><span></span></div>
 <main><canvas id="c"></canvas><img id="cam" alt="camera"></main>
+<button id="chatbtn">💬 Chat</button>
+<div id="chat"><header style="display:flex;gap:8px;align-items:center;background:#242b38"><b style="flex:1">Chat with the robot</b><button id="chatnew">New</button><button id="chatx">×</button></header>
+ <div id="chatlog"></div>
+ <form id="chatform"><input id="chatin" placeholder="Ask what it sees, or give it a task…" autocomplete="off"><button id="chatsend" style="background:#7048e8">Send</button></form></div>
 <div id="pv" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9;align-items:center;justify-content:center;flex-direction:column;gap:10px">
  <img id="pvimg" style="max-width:90vw;max-height:78vh;border-radius:8px"><div id="pvt" style="color:#9aa4b2"></div>
  <div style="display:flex;gap:10px"><button id="pvdel" style="background:#d64545">Delete pin</button><button id="pvclose" style="background:#3b4252">Close</button></div></div>
@@ -1438,7 +1744,7 @@ const snapBtn=document.getElementById('snap'), pv=document.getElementById('pv');
 async function loadPhotos(){photos=(await (await fetch('/photos')).json()).photos;draw()}
 snapBtn.onclick=async()=>{const r=await post('/photo',{});if(!r.ok)return flash(r.error);photos=r.photos;flash('Photo pinned at the car\'s position');draw()};
 function showPhoto(p){pvId=p.id;document.getElementById('pvimg').src='/photo/'+p.id+'.jpg?'+Date.now();
-  document.getElementById('pvt').textContent=`Pin ${p.id} - ${p.t} - at (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) m`;pv.style.display='flex'}
+  document.getElementById('pvt').textContent=`Pin ${p.id}${p.note?' \u201c'+p.note+'\u201d':''} - ${p.t} - at (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) m`;pv.style.display='flex'}
 document.getElementById('pvclose').onclick=()=>{pv.style.display='none'};
 document.getElementById('pvdel').onclick=async()=>{const r=await post('/photo',{action:'delete',id:pvId});photos=r.photos;pv.style.display='none';draw()};
 function drawPhotos(){photos.forEach(p=>{const q=w2p(p.x,p.y);
@@ -1583,8 +1889,43 @@ async function pollMap(){
   st.textContent='Mapping — '+(mpts.length/2)+' pts'+(s.skipped?', '+s.skipped+' scans skipped (drive slower)':'');
   drawMapping();
 }
+const chatEl=document.getElementById('chat'), chatLog=document.getElementById('chatlog'), chatIn=document.getElementById('chatin');
+function addMsg(cls,text,btn){const d=document.createElement('div');d.className='m '+cls;d.textContent=text;
+  if(btn){const b=document.createElement('button');b.textContent='▶ Start: '+btn;b.onclick=async()=>{
+    if(!confirm('The AI will drive the car by itself and send map + camera images to Anthropic. Watch it, and keep it away from stairs. Start?'))return;
+    aiTask.value=btn;const r=await post('/ai',{on:true,task:btn,radius:+xr.value});
+    addMsg('s',r.ok?'Task started - watch the AI log.':'Could not start: '+r.error);if(r.ok)b.disabled=true};d.appendChild(b)}
+  chatLog.appendChild(d);chatLog.scrollTop=chatLog.scrollHeight;return d}
+document.getElementById('chatbtn').onclick=()=>{chatEl.style.display=chatEl.style.display==='flex'?'none':'flex';
+  if(chatEl.style.display==='flex'){if(!chatLog.children.length)addMsg('s','Ask me what I see, where I am, or tell me what to do.');chatIn.focus()}};
+document.getElementById('chatx').onclick=()=>{chatEl.style.display='none'};
+document.getElementById('chatnew').onclick=async()=>{await post('/chat',{reset:true});chatLog.innerHTML='';addMsg('s','New conversation.')};
+document.getElementById('chatform').onsubmit=async e=>{e.preventDefault();const t=chatIn.value.trim();if(!t)return;
+  chatIn.value='';addMsg('u',t);let bub=addMsg('s','thinking…');chatIn.disabled=true;let got=false;
+  const handle=o=>{
+    if(o.t!==undefined){if(!got){got=true;bub.className='m a';bub.textContent=''}bub.textContent+=o.t;chatLog.scrollTop=chatLog.scrollHeight}
+    else if(o.error){if(!got)bub.remove();addMsg('s','⚠ '+o.error);got=true}
+    else if(o.done){if(!got)bub.remove();(o.actions||[]).forEach(a=>{if(a.type==='propose')addMsg('s','Suggested task',a.task);
+      else if(a.type==='pinned')addMsg('s','📷 Photo pinned: '+a.note);else if(a.type==='stopped')addMsg('s','■ Robot stopped')})}};
+  try{const resp=await fetch('/chat',{method:'POST',body:JSON.stringify({message:t})});
+    const rd=resp.body.getReader(),dec=new TextDecoder();let buf='';
+    for(;;){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
+      let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i);buf=buf.slice(i+1);if(line.trim())handle(JSON.parse(line))}}
+  }catch(err){if(!got)bub.remove();addMsg('s','⚠ '+err)}
+  chatIn.disabled=false;chatIn.focus()};
+let aiShown=0;
+function mirrorAi(ai){      // the AI's own decisions show up in the chat box as they happen
+  if(ai.n<aiShown)aiShown=ai.n;
+  if(ai.n>aiShown){const fresh=ai.log.slice(-Math.min(ai.n-aiShown,ai.log.length));aiShown=ai.n;
+    fresh.forEach(l=>addMsg('a','🤖 '+l))}}
 const exBtn=document.getElementById('explore'), xr=document.getElementById('xr');
-let exploring=false;
+let exploring=false, aiOn=false;
+const aiBtn=document.getElementById('aibtn'), aiTask=document.getElementById('aitask'), aiLog=document.getElementById('ailog'), aiStat=document.getElementById('aistat');
+aiBtn.onclick=async()=>{
+  if(!aiOn&&!confirm('The AI will drive the car by itself and send map + camera images to Anthropic. Keep it away from stairs you cannot block off, and watch it. Start?'))return;
+  const r=await post('/ai',{on:!aiOn,task:aiTask.value,radius:+xr.value});
+  if(!r.ok)flash(r.error);
+};
 exBtn.onclick=async()=>{
   if(!exploring&&!confirm('The car will drive by itself. Keep it away from stairs or drops you cannot block off, and watch it. Start?'))return;
   const r=await post('/explore',{on:!exploring,radius:+xr.value});
@@ -1626,6 +1967,10 @@ async function poll(){
   learnOn=s.learn;showLearn();
   document.getElementById('mstat').textContent='+'+s.added+' / −'+s.removed+' pts';
   if(s.map_version!==lastVer&&!mapping){const first=lastVer<0;lastVer=s.map_version;if(!first)loadMap()}
+  aiOn=!!(s.ai&&s.ai.on);aiBtn.textContent=aiOn?'■ Stop AI':'🧠 AI';aiBtn.style.background=aiOn?'#d64545':'#7048e8';
+  if(s.ai)mirrorAi(s.ai);
+  if(s.ai){aiLog.style.display=s.ai.log.length?'block':'none';aiLog.textContent=s.ai.log.join('\n');aiLog.scrollTop=aiLog.scrollHeight;
+    aiStat.textContent=s.ai.tokens[0]?`tokens in ${s.ai.tokens[0]} / out ${s.ai.tokens[1]} / cached ${s.ai.tokens[2]}`:''}
   exploring=s.explore;exBtn.textContent=exploring?'■ Stop exploring':'🧭 Auto-explore';exBtn.style.background=exploring?'#d64545':'#1c7ed6';
   pose=s.pose; yaw=s.yaw; const was=moving; moving=s.moving;
   if(moving){path=s.path}
@@ -1692,6 +2037,15 @@ def main():
         loc.start()
         print("Waiting for first LiDAR scan…")
         loc.wait_scans(2, timeout=15)
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if tok and loc:
+        import telegram_bot
+        allowed = [int(x) for x in os.environ.get("TELEGRAM_ALLOWED_IDS", "").replace(" ", "").split(",") if x]
+        telegram_bot.TelegramBot(tok, allowed, {
+            "context": chat_context, "turn": chat_turn,
+            "new_chat": lambda: chat and chat.reset(),
+            "start_task": ai_start, "stop": robot_stop,
+            "ai_state": lambda: (explorer.ai_n, list(explorer.ai_log))}, log).start()
     print(f"Open http://localhost:{a.port}  (or http://<pi-ip>:{a.port})")
     try:
         ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
