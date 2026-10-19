@@ -1,0 +1,176 @@
+% IEEE conference-format draft. Build: pdflatex paper && bibtex paper && pdflatex paper && pdflatex paper
+% Rule: every \todo{...} is a placeholder. No number may replace one unless it comes from runs/ via analyze_tasks.py.
+\documentclass[conference]{IEEEtran}
+\usepackage{graphicx,booktabs,amsmath,xcolor,url}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+\begin{document}
+
+\title{How Much Skill Does an LLM Need? Composing Behaviour from Primitives on a Low-Cost LiDAR Robot Behind a Safety Layer}
+
+\author{\IEEEauthorblockN{Priyank Sharma}
+\IEEEauthorblockA{\todo{affiliation}\\ sharma.priyankraj@gmail.com}}
+
+\maketitle
+
+\begin{abstract}
+LLM agents are usually given a tool for every behaviour they need. We ask what happens when the tool is taken away.
+On a low-cost indoor robot (Raspberry Pi~5, 2D LiDAR, low monocular camera, differential drive) a vision-language LLM selects one call per step from a typed skill library,
+while a classical layer (ICP localization, A* planning, no-go zones, a camera ledge detector, stuck detection) validates and executes every call, so a wrong plan cannot make the robot unsafe.
+We vary the skill library over three levels---a dedicated \texttt{push\_object} skill, navigation skills only, and bare drive/turn primitives---and measure how well the LLM
+pushes a ball to a target and navigates to named places at each level, with and without a cross-run lesson memory, against a scripted no-LLM baseline.
+\todo{Headline result: success rate with 95\% CIs per skill level, collisions, falls, rejected calls, cost per trial.}
+Mapping, route planning and natural-language status reports serve as supporting tasks that exercise the same loop.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LLM agents, skill abstraction, mobile robots, indoor navigation, non-prehensile manipulation, safety
+\end{IEEEkeywords}
+
+\section{Introduction}
+Affordable home robots run fixed behaviours; a new task means new code. LLMs can decompose open-ended instructions, yet most LLM-robot work assumes arms, simulators,
+or maps built beforehand~\cite{saycan,codeaspolicies,innermonologue}. We ask a practical question: \emph{how much of a home robot's autonomy can one LLM supply on a
+$\sim$\todo{cost}\,USD wheeled platform whose only ``manipulator'' is its own body, and can that be done without giving up safety?}
+
+Our central question is narrower: \emph{when the dedicated tool for a behaviour is removed, how much of it can the LLM compose from lower-level skills, and what does the safety layer have to guarantee while it tries?}
+We study it on one design with a controlled variable, the skill library, and three hypotheses stated before data collection:
+\begin{itemize}
+\item \textbf{H1.} Success on pushing a ball to a target falls monotonically from full to mid to primitive skill levels, but stays above zero at the primitive level.
+\item \textbf{H2.} A one-line cross-run lesson memory raises primitive-level push success over successive trials.
+\item \textbf{H3.} With the safety layer active, falls and collisions are near zero at every level, including when the LLM issues invalid or unsafe calls (rejected and logged).
+\end{itemize}
+The same loop also performs three supporting tasks, reported in less depth: roaming an unknown home to build a map, routing to named places on a finished map, and answering status queries grounded in live state.
+
+\noindent\textbf{Contributions.}
+(i)~A controlled study of skill abstraction level for an LLM controller on a physical robot, using a tool-free task (pushing) with tape-measured outcomes. \todo{RESULT}
+(ii)~A safety-layered architecture in which the LLM only selects among planner-validated skills and receives an error string when a call is rejected, so it can correct itself. \todo{rejected-call and fall counts}
+(iii)~Owner-authored place pins with free-text instructions the LLM interprets on arrival (a small extension, evaluated separately). \todo{RESULT or drop}
+(iv)~An on-device pipeline on a Pi~5 where LLM calls are the only off-device component, and an open protocol with per-trial logs. \todo{release code/logs}
+
+\section{Related Work}
+\todo{Verify every citation against the original before submission; add 2024--2026 work.}
+\textbf{LLM planning for robots.} SayCan grounds LLM plans in affordance values~\cite{saycan}; Inner Monologue feeds back scene and success signals~\cite{innermonologue};
+Code as Policies has the LLM write robot code~\cite{codeaspolicies}; ReAct interleaves reasoning and acting~\cite{react}.
+\textbf{Language-conditioned navigation.} LM-Nav combines an LLM, a VLM and a navigation model over a topological graph~\cite{lmnav}. \todo{VLMaps, NavGPT, ESC, L3MVN}
+\textbf{Classical components.} Frontier exploration~\cite{yamauchi}, ICP~\cite{icp}, and pushing mechanics~\cite{mason}.
+\textbf{Gap.} Prior work seldom varies the \emph{abstraction level of the skill library} as an experimental factor on a physical robot, nor measures what happens when the dedicated tool is removed, while a hard validator sits between the LLM and the motors. \todo{check this claim against 2024--26 literature before keeping it}
+
+\section{System}
+\subsection{Hardware}
+Raspberry Pi~5, serial 2D LiDAR, a forward camera about \todo{10}\,cm above the floor, and a differential-drive chassis. Localization, mapping, planning and safety checks run on the Pi; only LLM calls leave the device.
+
+\subsection{Localization and mapping}
+Scans are voxel-downsampled and registered to the stored map with ICP; a tracking-quality counter triggers relocalization against a distance field. Maps are saved as point clouds, with separate files for photo pins, zones and named objects.
+A probabilistic occupancy grid with inflated obstacles feeds A* planning with a wall-clearance penalty. Legs are short (at most 1.5\,m) so the scan matcher stays locked.
+
+\subsection{Safety layer}
+A 2D LiDAR cannot see drops. A camera-based ledge score is checked while driving; when it trips, the car stops, backs off, and a no-go box is added ahead.
+Further guards are obstacle detours, stuck detection, per-run decision caps and a fallback when the API fails. User- and LLM-authored no-go zones are enforced by the planner; the LLM cannot delete a box it created.
+The chat front end can only \emph{propose} a task: the robot moves after the owner confirms.
+
+\subsection{LLM decision layer}
+At each step the model (\texttt{claude-opus-5-5}, low reasoning effort \todo{confirm for all runs}) receives the task text, the last ten action/result lines, a rendered map image (free, unknown, walls, safety margins, zones, pins, frontiers, robot pose, metre grid), the latest camera frame and a status text.
+It must return exactly one tool call with a reason of at most 25 words. Invalid arguments are returned as \texttt{error:} text.
+The LLM cannot create no-go zones (an earlier version could; see Section~\ref{sec:cases}); owner-drawn zones and the camera ledge check are enforced by the planner. Three skill levels are defined (Table~\ref{tab:levels}). Optionally, a one-line lesson is distilled after each run and prepended to later prompts (\emph{memory}).
+
+\begin{table}[t]
+\caption{Skill levels offered to the LLM (all include \texttt{turn\_to}, \texttt{pin\_photo}, \texttt{add\_no\_go}, \texttt{finish}).}
+\label{tab:levels}
+\centering
+\begin{tabular}{ll}
+\toprule
+Level & Additional skills \\
+\midrule
+full & \texttt{explore\_to}, \texttt{go\_to}, \texttt{push\_object} \\
+mid & \texttt{explore\_to}, \texttt{go\_to}, \texttt{drive\_forward}, \texttt{drive\_back} \\
+primitive & \texttt{drive\_forward}, \texttt{drive\_back} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Owner-authored place pins}
+The owner drops a named pin on a known-free spot of the map and may attach a description, an icon or picture (for the map view) and free-text \emph{instructions} for the robot, e.g.\ ``take a photo, turn slowly all round, then finish''. Pins are stored beside the map. The status text lists each pin with its instructions, and when \texttt{go\_to\_place} reports arrival the result repeats the instructions, so the LLM decides which of its own skills to use to carry them out. Pin locations are validated against the occupancy grid and the pins cannot create motion that bypasses the planner. \todo{Evaluate: fraction of pin instructions followed correctly over $\ge$5 trials per instruction type; do not claim before this is measured.}
+
+\subsection{Pushing skill}
+\texttt{push\_object(label, x, y)} finds the object with the camera, estimates its floor position from the image row (known camera height and field of view, range $=h/\tan\theta$) and bearing, stages the car 0.4\,m behind it on the object-to-target line, then pushes in 0.35\,m chunks.
+After each chunk the car backs off and re-detects the ball, because a touching ball leaves the camera view. It returns \texttt{ok}, \texttt{partial} or \texttt{error} with the remaining distance, and the ledge check and no-go zones stay active throughout.
+In the mid and primitive conditions this skill is absent and the LLM must construct the same behaviour from drive and turn calls.
+
+\section{Experiments}
+\textbf{Questions.}
+RQ1 (H1): how does push success change across full, mid and primitive skill levels?
+RQ2 (H2): does lesson memory help at the primitive level?
+RQ3 (H3): are collisions and falls near zero, and how often does the validator reject a call?
+RQ4: does routing to named places succeed at each level?
+RQ5: what do runs cost in time, LLM calls and tokens?
+Mapping and status accuracy are supporting tasks. \textbf{Baseline:} a scripted controller that stages and pushes with the ball position given, and plain A* routing to the place.
+
+\textbf{Protocol.} Fixed start pose, \todo{M} rooms, tape-measured ground truth, randomized trial order, frozen prompt per condition, 15-minute cap.
+Each trial logs success, time, LLM calls, tokens, rejected calls, collisions and human interventions; success is judged only from a tape measure.
+Success is reported with Wilson 95\% intervals; time and cost as median and IQR. Task definitions:
+\textbf{Map}: coverage of the reference map with zero falls; \textbf{Route}: final pose within 0.5\,m; \textbf{Status}: answers checked against logged state;
+\textbf{Push}: ball centre within 0.25\,m of target.
+
+
+\section{Case Studies: Home Tasks Given in Natural Language}
+\label{sec:cases}
+We report two household tasks the owner typed into the chat interface. The chat assistant turns the request into a task with map coordinates (it can only \emph{propose}; the robot moves after the owner presses Start), and the planning LLM then drives the run. These are single runs (n=1 each) shown as illustrations, not statistics; repeated trials are in Table~\ref{tab:results}. \todo{repeat each >=5 times}
+
+\textbf{Task 1: ``Go to the kitchen and find out what is happening outside.''}
+The owner had pinned a place ``Kitchen Door'' (name and description) on the map. The LLM called \texttt{go\_to\_place} five times, each time driving one leg and reading the remaining distance (4.7, 3.6, 3.0, 1.6\,m, then ``arrived''), saved a photo pin facing outward and finished with a written report.
+The logged run took 68.5\,s, 6.39\,m of driving, 7 LLM calls, with no ledge alarms and no rejected calls (run \texttt{full\_go-to-the-kitchen-door-place-a}). When the owner later asked ``what is happening outside?'', the chat assistant answered from the pin and robot state. \todo{score answer against the photo}
+
+\textbf{Task 2: ``Welcome the guest.''}
+The assistant proposed going to the ``Welcome Door'', facing it, looking for a guest and saving a photo. The robot drove 8.69\,m in 8 LLM calls (66.3\,s) and stopped 1.1\,m short of the door point on its own judgement, because the point lay beside a no-go box and a stair railing; it reported that the door was visible and no guest was in view.
+The robot has no speaker or arm, so ``welcoming'' here means reaching the entrance, checking for a person and reporting. We do not claim greeting behaviour. \todo{define success: pose within 0.5\,m? here 1.1\,m, so this run counts as a partial/failure under that rule}
+
+\textbf{An unsafe-planner observation.} In an earlier run with the \texttt{add\_no\_go} tool enabled, the LLM drew two no-go boxes at the foot of the stairs after seeing them on camera, while heading for the kitchen. The boxes were added near its own route (run \texttt{full\_go-to-the-kitchen-door-place-9}) and the run ended without reaching the kitchen.
+We removed the tool so that only the owner and the ledge detector create zones. \todo{decide whether this is reported as a failure mode or a design justification; only claim it if more runs agree}
+
+\textbf{Pushing.} Two logged push attempts did not move the ball: one failed because the requested target was not known free floor and the ball was then not found, and in the other the LLM declined to push because the heading pointed toward the stairs zone. \todo{No successful push is in the logs yet; do not claim one until a logged, tape-measured run exists.}
+
+\section{Results}
+\todo{All numbers pending. Fill from runs/ using analyze\_tasks.py. Do not write results here from memory or from single anecdotal runs.}
+
+\begin{table}[t]
+\caption{Task success by condition (placeholder).}
+\label{tab:results}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Task & full & mid & primitive & primitive+mem \\
+\midrule
+Map (coverage) & \todo{--} & \todo{--} & \todo{--} & \todo{--} \\
+Route & \todo{--} & \todo{--} & \todo{--} & \todo{--} \\
+Status accuracy & \todo{--} & \todo{--} & \todo{--} & \todo{--} \\
+Push ball & \todo{--} & \todo{--} & \todo{--} & \todo{--} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Planned figures (headline first: push success versus skill level with CIs): map and trajectory of one roaming run; one pushing trial with the ball path; success versus skill level; ledge-detector true/false positives from the hazard images.
+
+\section{Discussion and Limitations}
+Expected limits to state with data: per-decision latency and cloud dependence; non-determinism of the LLM; cost per run; a 2D LiDAR blind to low objects;
+range from the image row is coarse beyond about 1\,m; no gripper, so only pushing; one robot and \todo{M} rooms; camera--LiDAR extrinsics from tape measurements.
+A failure taxonomy will be built from logs. \todo{RESULT}
+
+\section{Conclusion}
+\todo{Write after results.}
+
+\section*{Acknowledgment}
+\todo{if any}
+
+\begin{thebibliography}{99}
+% Entries from memory; check authors, venue, year and pages against the sources.
+\bibitem{saycan} M. Ahn \emph{et al.}, ``Do as I can, not as I say: Grounding language in robotic affordances,'' in \emph{Proc. CoRL}, 2022.
+\bibitem{innermonologue} W. Huang \emph{et al.}, ``Inner Monologue: Embodied reasoning through planning with language models,'' in \emph{Proc. CoRL}, 2022.
+\bibitem{codeaspolicies} J. Liang \emph{et al.}, ``Code as Policies: Language model programs for embodied control,'' in \emph{Proc. IEEE ICRA}, 2023.
+\bibitem{react} S. Yao \emph{et al.}, ``ReAct: Synergizing reasoning and acting in language models,'' in \emph{Proc. ICLR}, 2023.
+\bibitem{lmnav} D. Shah, B. Osinski, B. Ichter, and S. Levine, ``LM-Nav: Robotic navigation with large pre-trained models of language, vision, and action,'' in \emph{Proc. CoRL}, 2022.
+\bibitem{yamauchi} B. Yamauchi, ``A frontier-based approach for autonomous exploration,'' in \emph{Proc. IEEE CIRA}, 1997.
+\bibitem{icp} P. J. Besl and N. D. McKay, ``A method for registration of 3-D shapes,'' \emph{IEEE Trans. PAMI}, vol. 14, no. 2, 1992.
+\bibitem{mason} M. T. Mason, ``Mechanics and planning of manipulator pushing operations,'' \emph{Int. J. Robotics Research}, vol. 5, no. 3, 1986.
+\end{thebibliography}
+
+\end{document}

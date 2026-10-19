@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .camvenv/
+
+# Secrets
+.env
+
+# Experiment logs (large, keep outside git)
+runs/*/
+runs/*.jsonl

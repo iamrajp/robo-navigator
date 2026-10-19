@@ -25,8 +25,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+
+def _load_env(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+    """Load KEY=VALUE lines from .env into os.environ (real env vars win, blanks are skipped)."""
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        k, v = k.strip().removeprefix("export ").strip(), v.strip().strip("\"'")
+        if k and v:
+            os.environ.setdefault(k, v)
+
+
+_load_env()  # before llm_brain is imported: it reads LLM_* settings at import time
+
 from navigate import RES, GridMap
 import explore as ex
+import experiment
+import objects as obj_mod
+import push
 
 ARRIVE_M = 0.15          # waypoint reached within this distance
 AIM_TOL = math.radians(12)
@@ -138,6 +160,141 @@ def load_zones(map_file):
     except (OSError, ValueError):
         zones = []
     load_photos(map_file)
+    load_objects(map_file)
+    load_places(map_file)
+
+
+# ── named objects (bed, desk, stairs... placed by camera + LiDAR: maps/foo.pcd -> foo.objects.json) ──
+map_objects = []    # [{"id", "label", "x", "y", "seen", "t"}] for the loaded map; while mapping they live in explorer.objects
+obj_lock = threading.Lock()
+obj_busy = threading.Lock()
+obj_last = [None]   # (x, y, heading) of the last auto-scan
+
+
+def load_objects(map_file):
+    try:
+        with open(os.path.splitext(map_file)[0] + ".objects.json") as f:
+            map_objects[:] = json.load(f)
+    except (OSError, ValueError):
+        map_objects[:] = []
+
+
+def save_objects():
+    try:
+        with open(photos_base[0] + ".objects.json", "w") as f:
+            json.dump(map_objects, f)
+    except OSError as e:
+        log(f"[objects] could not save: {e}")
+
+
+def object_pool():
+    return explorer.objects if loc and loc.mode == "map" else map_objects
+
+
+def scan_objects(force=False):
+    """Snapshot camera frame + pose + LiDAR sweep now (call while the car is stopped); the vision call runs in the background.
+    Returns "" when started, otherwise why not."""
+    if not loc or not camera or camera.frame is None:
+        return "camera or LiDAR not available"
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return "ANTHROPIC_API_KEY not set"
+    if nav.fwd_off is None:
+        return "drive forward once first so the car learns which way is front"
+    x, y, yaw, _ = loc.pose()
+    h = nav.heading(yaw)
+    last = obj_last[0]
+    if not force and last and math.dist(last[:2], (x, y)) < 0.4 and abs(wrap(h - last[2])) < 0.6:
+        return "already looked from here"
+    if not obj_busy.acquire(blocking=False):
+        return "still identifying the previous view"
+    obj_last[0] = (x, y, h)
+    threading.Thread(target=_scan_worker, args=(camera.frame, loc.live_points(), (x, y, yaw), nav.fwd_off, nav.turn_sign,
+                                                   object_pool()), daemon=True).start()
+    return ""
+
+
+def _scan_worker(frame, pts, pose, fwd_off, left_sign, pool):
+    try:
+        found = obj_mod.detect(frame)
+        added = []
+        for o in found:
+            hit = obj_mod.place(o["x_frac"], pts, pose, fwd_off, left_sign)
+            if hit is None:
+                continue                          # no LiDAR surface that way: can't say where it is
+            with obj_lock:
+                m = obj_mod.merge(pool, o["label"], hit[0], hit[1], time.strftime("%H:%M:%S %d %b"))
+            if m:
+                added.append(f"{o['label']}@({hit[0]:.1f},{hit[1]:.1f})")
+        if pool is map_objects:
+            save_objects()
+        log(f"[objects] saw {len(found)}, placed: {', '.join(added) or 'none'}")
+    except Exception as e:
+        log(f"[objects] identify failed: {e!r}")
+    finally:
+        obj_busy.release()
+
+
+def objects_line(pool):
+    return "Objects on map: " + ("; ".join(f"{o['label']} at ({o['x']:.1f},{o['y']:.1f})" for o in pool[-15:]) or "none") + "."
+
+
+# ── named places (pins you drop on the map with a name + description; the LLM can drive to them: foo.pcd -> foo.places.json) ──
+places = []         # [{"id": int, "name": str, "description": str, "instructions": str, "icon": str, "img": int|None, "x": m, "y": m, "t": "HH:MM:SS date"}]
+
+
+def load_places(map_file):
+    try:
+        with open(os.path.splitext(map_file)[0] + ".places.json") as f:
+            places[:] = json.load(f)
+    except (OSError, ValueError):
+        places[:] = []
+
+
+def save_places():
+    try:
+        with open(photos_base[0] + ".places.json", "w") as f:
+            json.dump(places, f, indent=1)
+    except OSError as e:
+        log(f"[places] could not save: {e}")
+
+
+def place_img_file(pid):
+    return f"{photos_base[0]}.places/{int(pid)}.jpg"
+
+
+def set_place_image(pl, data):
+    """Apply an uploaded picture (data-URL jpeg from the browser) or a removal request to a place dict."""
+    img = data.get("image")
+    if img:
+        try:
+            raw = base64.b64decode(str(img).split(",", 1)[-1], validate=False)
+            if len(raw) > 2_000_000 or raw[:2] != b"\xff\xd8":
+                return "Picture must be a JPEG under 2 MB"
+            os.makedirs(photos_base[0] + ".places", exist_ok=True)
+            with open(place_img_file(pl["id"]), "wb") as f:
+                f.write(raw)
+            pl["img"] = int(time.time())
+        except (OSError, ValueError) as e:
+            return f"Could not save the picture: {e}"
+    elif data.get("clear_image"):
+        pl["img"] = None
+        try:
+            os.remove(place_img_file(pl["id"]))
+        except OSError:
+            pass
+
+
+def find_place(name):
+    """Case-insensitive exact match first, then a unique substring match. -> place dict or None."""
+    n = str(name).strip().lower()
+    hit = [p for p in places if p["name"].lower() == n] or [p for p in places if n and (n in p["name"].lower() or p["name"].lower() in n)]
+    return hit[0] if len(hit) == 1 or (hit and hit[0]["name"].lower() == n) else None
+
+
+def places_line():
+    return "Named places (go there with go_to_place; follow any [on arrival] instructions once you get there): " + (
+        "; ".join(f"\"{p['name']}\"" + (f" ({p['description']})" if p.get("description") else "") + f" at ({p['x']:.1f},{p['y']:.1f})" + (f" [on arrival: {p['instructions']}]" if p.get("instructions") else "")
+                  for p in places[-20:]) or "none") + "."
 
 
 # ── photo pins (camera snapshots pinned on the map: maps/foo.pcd -> foo.photos.json + foo.photos/<id>.jpg) ──
@@ -805,6 +962,18 @@ class Navigator:
         else:
             self.turn_rate = 0.6 * self.turn_rate + 0.4 * (abs(dyaw) / secs)
 
+    def face(self, goal, tries=14):
+        """Turn in place until the car's front points along world heading `goal` (radians)."""
+        for _ in range(tries):
+            if state["stop"]:
+                break
+            _, _, yw, _ = loc.wait_scans()
+            err = wrap(goal - self.heading(yw))
+            if abs(err) < AIM_TOL:
+                break
+            self.turn_step(err, yw)
+        loc.hold_until = time.time() + SETTLE_S
+
     def approach(self, path, k):
         """Drive to waypoint k. Returns "arrived", "rerouted" (path changed, call again) or None (stopped)."""
         wx, wy = path[k]
@@ -942,6 +1111,7 @@ class Explorer:
         self.occ = None
         self.zones = []              # no-go boxes drawn automatically; they become the new map's zones on save
         self.pins = []               # photo pins taken while mapping (written with the map on save)
+        self.objects = []            # named objects found while mapping (written with the map on save)
         self.target = None
         self.bad = []                # frontier spots that failed
         self.trail = []              # places the car has stopped and looked from
@@ -950,14 +1120,22 @@ class Explorer:
         self.hazards = 0
         self.fails = 0
         self.brain, self.task, self.ai_log, self.ai_n, self.finished = None, "", [], 0, None
+        self.runlog = None
 
     def reset(self):
         self.occ, self.zones, self.pins, self.bad, self.trail, self.target, self.hazards = None, [], [], [], [], None, 0
+        self.objects = []
+        obj_last[0] = None
 
     def start(self, radius, brain=None, task=""):
         self.radius, self.on, self.brain, self.task = radius, True, brain, task
         self.ai_log, self.ai_n, self.finished, self.fails = [], 0, None, 0
         threading.Thread(target=self.run, daemon=True).start()
+
+    def snap(self, frame, tag):
+        """Keep a camera frame with the run's log (unless EXP_LOG=0). Returns the file name or None."""
+        if self.runlog and frame:
+            return self.runlog.snap(frame, tag)
 
     def hazard_now(self):
         fr = camera.frame if camera else None
@@ -995,6 +1173,8 @@ class Explorer:
             with open(f"explore_hazards/{time.strftime('%Y%m%d-%H%M%S')}.jpg", "wb") as f:
                 f.write(camera.frame)
         log(f"[explore] no-go box added ahead of ({x:.2f},{y:.2f}) - possible ledge ({self.hazards})")
+        if self.runlog:
+            self.runlog.event("ledge_alarm", x=round(x, 3), y=round(y, 3), n=self.hazards)
 
     def candidates(self, g, car_xy):
         """Reachable, not-yet-seen frontiers as [(dist, size, cell, path)], nearest first."""
@@ -1053,6 +1233,9 @@ class Explorer:
         lines = [f"Robot at ({car_xy[0]:.2f}, {car_xy[1]:.2f}) m, facing {math.degrees(wrap(h)):.0f} deg (0 = +x, 90 = +y).",
                  f"No-go boxes: {len(zl)}. Ledge alarms this run: {self.hazards}.",
                  f"Decisions used: {self.brain.decisions}/{llm_brain.MAX_DECISIONS}."]
+        lines.append(objects_line(object_pool()))
+        if nav_mode:
+            lines.append(places_line())
         if pins:
             lines.append("Photo pins: " + "; ".join(f"{p['id']}={p.get('note') or 'photo'} at ({p['x']:.1f},{p['y']:.1f})" for p in pins[-12:]))
         if nav_mode:
@@ -1062,7 +1245,15 @@ class Explorer:
                 f"F{i + 1} at ({c[2][0]:.1f},{c[2][1]:.1f}) {c[0]:.1f} m, {c[1]} cells" for i, c in enumerate(cands)))
         else:
             lines.append("There are no reachable frontiers left.")
-        allowed = {"go_to", "turn_to", "pin_photo", "add_no_go", "finish"} | (set() if nav_mode else {"explore_to"})
+        allowed = set(llm_brain.allowed_tools())
+        allowed.discard("explore_to" if nav_mode else "push_object")
+        if not (nav_mode and places):
+            allowed.discard("go_to_place")
+        n_next = self.brain.decisions + 1
+        imgs = []
+        if self.runlog:
+            imgs = [self.runlog.snap_png(png, f"d{n_next}_map"), self.snap(camera.frame if camera else None, f"d{n_next}_cam")]
+        t_think = time.time()
         try:
             name, args = self.brain.decide(self.task, png, camera.frame if camera else None, "\n".join(lines), allowed)
         except llm_brain.DecisionLimit:
@@ -1074,7 +1265,14 @@ class Explorer:
             self.ai_log.append(f"AI error ({e}) - built-in explorer used")
             return self.heuristic_step(cands)
         why = args.get("reason") or args.get("note") or args.get("summary") or ""
+        t_exec = time.time()
+        think_s = t_exec - t_think
         res = self.execute(name, args, g, car_xy, yaw, cands)
+        if self.runlog:
+            after = self.snap(camera.frame if camera else None, f"d{n_next}_after_{name}")
+            self.runlog.decision(name, args, res, self.brain, time.time() - t_exec,
+                                 pose=[round(car_xy[0], 3), round(car_xy[1], 3), round(math.degrees(wrap(h)), 1)],
+                                 imgs=[i for i in imgs + [after] if i], think_s=think_s)
         self.brain.note_result(f"{self.brain.decisions}. {name}({json.dumps(args)[:120]}) -> {res}")
         self.ai_log.append(f"#{self.brain.decisions} {name}: {why} -> {res}")
         self.ai_n += 1
@@ -1102,18 +1300,39 @@ class Explorer:
                     return "error: no path there"
                 self.target = tgt
                 return self.drive_leg(tgt, path) or "ok, drove toward the point"
+            if name == "go_to_place":
+                if loc.mode == "map":
+                    return "error: named places only work on a finished map"
+                pl = find_place(args.get("name", ""))
+                if pl is None:
+                    return "error: no place called %r. Known places: %s" % (args.get("name", ""), ", ".join(p["name"] for p in places) or "none")
+                todo = f" Owner's instructions for this place - do them now: {pl['instructions']}" if pl.get("instructions") else ""
+                if math.dist(car_xy, (pl["x"], pl["y"])) < 0.4:
+                    return f"arrived at \"{pl['name']}\"." + todo
+                res = self.execute("go_to", {"x": pl["x"], "y": pl["y"]}, g, car_xy, yaw, cands)
+                if str(res).startswith("error"):
+                    return res.replace("that point", f"the place \"{pl['name']}\"")
+                left = math.dist(cur_pose()[0], (pl["x"], pl["y"]))
+                return (f"arrived at \"{pl['name']}\"." + todo if left < 0.4 else f"ok, drove toward \"{pl['name']}\", {left:.1f} m left - call go_to_place again")
             if name == "turn_to":
-                goal = math.radians(float(args["heading_deg"]))
-                for _ in range(14):
-                    if state["stop"]:
-                        break
-                    _, _, yw, _ = loc.wait_scans()
-                    err = wrap(goal - nav.heading(yw))
-                    if abs(err) < AIM_TOL:
-                        break
-                    nav.turn_step(err, yw)
-                loc.hold_until = time.time() + SETTLE_S
+                nav.face(math.radians(float(args["heading_deg"])))
                 return "ok, turned"
+            if name in ("drive_forward", "drive_back"):
+                if not car:
+                    return "error: needs the real car"
+                dist = float(args["meters"])
+                if not 0.05 <= dist <= 0.5:
+                    return "error: meters must be 0.05 to 0.5"
+                robot = CarRobot()
+                if name == "drive_back":
+                    return f"ok, backed up {robot.back(dist):.2f} m"
+                return robot.advance(dist)
+            if name == "push_object":
+                if not car or not camera:
+                    return "error: pushing needs the real car and camera"
+                if loc.mode == "map":
+                    return "error: pushing needs a finished map (navigation mode)"
+                return push.push_object(CarRobot(), str(args["label"])[:30], (float(args["x"]), float(args["y"])))
             if name == "pin_photo":
                 fr = camera.frame if camera else None
                 if fr is None:
@@ -1127,14 +1346,7 @@ class Explorer:
                     store_pin(entry, fr)
                 return "ok, photo pinned"
             if name == "add_no_go":
-                x, y, w, h = (float(args[k]) for k in ("x", "y", "w", "h"))
-                if not (0.2 <= w <= 3.0 and 0.2 <= h <= 3.0):
-                    return "error: box sides must be 0.2 to 3 m"
-                if abs(car_xy[0] - x) < w / 2 + 0.1 and abs(car_xy[1] - y) < h / 2 + 0.1:
-                    return "error: the box would contain the robot; place it ahead of the robot instead"
-                self.add_zone([(x - w / 2, y - h / 2), (x + w / 2, y - h / 2), (x + w / 2, y + h / 2), (x - w / 2, y + h / 2)],
-                              "ai: " + str(args.get("reason", ""))[:60])
-                return "ok, no-go box added"
+                return "error: the LLM may not create no-go boxes; avoid that area and respect the existing ones"
             if name == "finish":
                 self.finished = str(args.get("summary", ""))
                 return "finished"
@@ -1163,7 +1375,10 @@ class Explorer:
         loc.strict = not nav_mode
         old_move_t, old_max_turn = nav.move_t, nav.max_turn
         nav.move_t, nav.max_turn = EXPLORE_MOVE_T, EXPLORE_TURN_T
+        runlog = self.runlog = experiment.RunLog("ai" if self.brain else "heuristic", task=self.task, map=current_map[0],
+                                                  places=[p["name"] for p in places], pose=[round(v, 3) for v in cur_pose()[0][:2]])
         try:
+            self.snap(camera.frame if camera else None, "start")
             if nav.fwd_off is None:
                 state["msg"] = "Calibrating…"
                 nav.calibrate_forward()
@@ -1184,6 +1399,9 @@ class Explorer:
                     self.occ.update((x, y), P @ T[:2, :2].T + T[:2, 3])
                     gm = g = ex.ExploreGrid(self.occ, [z["pts"] for z in self.zones], gm_radius + EXPLORE_CLEARANCE, (x, y))
                     cands = self.candidates(g, (x, y))
+                runlog.step((x, y), g, self)
+                if self.brain or os.environ.get("OBJECT_SCAN") == "1":
+                    scan_objects()
                 if self.brain:
                     state["msg"] = "AI is thinking…"
                     keep_going = self.ai_step(g, (x, y), yaw, cands)
@@ -1200,6 +1418,12 @@ class Explorer:
             state["msg"] = f"Stopped: {e}"
             log(f"[explore] aborted: {e!r}")
         finally:
+            self.snap(camera.frame if camera else None, "end")
+            runlog.end(state["msg"], self)
+            self.runlog = None
+            if self.brain and self.brain.decisions:
+                import llm_brain
+                threading.Thread(target=llm_brain.reflect, args=(self.task, list(self.ai_log), state["msg"], log), daemon=True).start()
             nav.hazard_check = None
             loc.strict = False
             nav.move_t, nav.max_turn = old_move_t, old_max_turn
@@ -1208,6 +1432,124 @@ class Explorer:
 
 
 explorer = Explorer()
+
+
+class CarRobot:
+    """push.py's view of the real car. All motion goes through the existing LiDAR pose feedback, no-go zones,
+    obstacle detours and the camera ledge check - the skill adds no new way to move."""
+    @staticmethod
+    def log(msg):
+        log(msg)
+        if explorer.runlog:
+            explorer.runlog.event("push", msg=str(msg)[:300])
+
+    @property
+    def left_sign(self):
+        return nav.turn_sign
+
+    def pose(self):
+        x, y, yaw, _ = loc.wait_scans()
+        return x, y, wrap(nav.heading(yaw))
+
+    def stopped(self):
+        return state["stop"]
+
+    def see(self, label):
+        time.sleep(0.4)                                   # let the camera image settle after a move
+        fr = camera.frame if camera else None
+        if fr is None:
+            return None
+        explorer.snap(fr, "look_" + label.replace(" ", "_"))
+        try:
+            return obj_mod.find(fr, label)
+        except Exception as e:
+            log(f"[push] vision call failed: {e!r}")
+            return None
+
+    def turn_to(self, heading):
+        nav.face(heading)
+
+    def forward(self, secs):
+        if nav.fwd_off is None:
+            nav.calibrate_forward()
+        car.pulse("F", secs)
+
+    def back(self, metres):
+        x0, y0, _ = self.pose()
+        moved = 0.0
+        for _ in range(8):
+            if state["stop"] or moved >= metres or nav.clear_dir(math.pi, 0.40) is not None:
+                break
+            car.pulse("B", 0.4)
+            x, y, _ = self.pose()
+            moved = math.hypot(x - x0, y - y0)
+        return moved
+
+    def advance(self, metres):
+        """Drive forward about `metres` with every safety check; -> result text."""
+        if nav.fwd_off is None:
+            nav.calibrate_forward()
+        x0, y0, _ = self.pose()
+        for _ in range(12):
+            x, y, _ = self.pose()
+            got = math.hypot(x - x0, y - y0)
+            if state["stop"]:
+                return "stopped"
+            if got >= metres - 0.03:
+                return f"ok, drove {got:.2f} m"
+            if explorer.hazard_now():
+                explorer.add_hazard_zone()
+                self.back(0.3)
+                return f"error: the ledge check stopped the car after {got:.2f} m; a no-go box was added ahead"
+            if gm.in_zone((x, y)):
+                self.back(0.3)
+                return "error: the car is inside a no-go zone"
+            ob = nav.blocked_ahead(0.25)
+            if ob is not None:
+                return f"error: something is {ob:.2f} m ahead; drove {got:.2f} m"
+            car.pulse("F", min(0.35, max(0.15, (metres - got) / 0.25)))
+        x, y, _ = self.pose()
+        return f"ok, drove {math.hypot(x - x0, y - y0):.2f} m"
+
+    def drive_to(self, x, y):
+        """Plan and drive to a map point in legs; -> None when there, else why not."""
+        for _ in range(8):
+            if state["stop"]:
+                return "stopped"
+            px, py, _ = self.pose()
+            if math.dist((px, py), (x, y)) < 0.15:
+                return None
+            path = gm.plan((px, py), (x, y))
+            if not path or len(path) < 2:
+                return "no path"
+            leg = ex.truncate(path, EXPLORE_LEG)
+            state["path"], state["wp"] = leg, 1
+            try:
+                nav.go(leg)
+            except Hazard:
+                explorer.add_hazard_zone()
+                nav.back_off(0.35)
+                return "the ledge check stopped the car; a no-go box was added"
+            except RuntimeError as e:
+                nav.back_off()
+                return str(e)
+        return "did not arrive"
+
+    def free(self, x, y):
+        cx, cy = gm.to_cell(x, y)
+        return bool(gm.inside(cx, cy) and gm.grid[cy, cx] == 0 and not gm.blocked[cy, cx])
+
+    def line_ok(self, a, b):
+        return not gm.hits_zone(a, b)
+
+    def in_zone(self, x, y):
+        return bool(gm.in_zone((x, y)))
+
+    def hazard(self):
+        return explorer.hazard_now()
+
+    def obstacle_ahead(self, limit):
+        return nav.blocked_ahead(limit)
 
 
 chat = None
@@ -1224,7 +1566,21 @@ def chat_turn(text, on_text=None):
         status, png, cam = chat_context()
         actions = []
         reply = chat.reply(text, png, cam, status, lambda n, a: chat_tool(n, a, actions), on_text=on_text)
+    log_chat(text, reply, status, actions)
     return reply, actions
+
+
+def log_chat(question, reply, status, actions):
+    """Every chat / status question with the robot state it was answered from (evidence for the status-update claim)."""
+    if os.environ.get("EXP_LOG", "1") == "0":
+        return
+    try:
+        os.makedirs("runs", exist_ok=True)
+        with open(f"runs/chat_{time.strftime('%Y%m%d')}.jsonl", "a") as f:
+            f.write(json.dumps({"time": time.strftime("%H:%M:%S"), "question": question, "reply": reply, "status": status,
+                                "actions": actions}) + "\n")
+    except OSError as e:
+        log(f"[chat] could not log: {e}")
 
 
 def ai_start(task, radius=5.0):
@@ -1245,6 +1601,8 @@ def ai_start(task, radius=5.0):
 
 
 def robot_stop():
+    if state["moving"] and explorer.runlog:
+        explorer.runlog.event("user_stop")
     state["stop"] = True
     if car:
         car.send("S")
@@ -1262,6 +1620,9 @@ def chat_context():
     mapping = loc and loc.mode == "map"
     zl = explorer.zones if mapping else zones
     pins = explorer.pins if mapping else photos
+    st_.append(objects_line(object_pool()))
+    if not mapping:
+        st_.append(places_line())
     st_.append(f"No-go boxes: {len(zl)}. Photo pins: " + ("; ".join(f"{p['id']}={p.get('note') or 'photo'} at ({p['x']:.1f},{p['y']:.1f})" for p in pins[-10:]) or "none") + ".")
     if gm is not None and (not mapping or explorer.occ is not None):
         try:
@@ -1344,12 +1705,22 @@ class H(BaseHTTPRequestHandler):
                 pass
         elif self.path == "/photos":
             self._send({"photos": photos})
+        elif self.path == "/places":
+            self._send({"places": places})
+        elif self.path.startswith("/placeimg/"):
+            try:
+                with open(place_img_file(self.path[10:].split(".")[0]), "rb") as f:
+                    self._send(f.read(), "image/jpeg")
+            except (OSError, ValueError):
+                self.send_error(404)
         elif self.path.startswith("/photo/"):
             try:
                 with open(photo_file(self.path[7:].split(".")[0]), "rb") as f:
                     self._send(f.read(), "image/jpeg")
             except (OSError, ValueError):
                 self.send_error(404)
+        elif self.path == "/objects":
+            self._send({"objects": object_pool()})
         elif self.path == "/zones":
             self._send({"zones": zones})
         elif self.path == "/speed":
@@ -1363,10 +1734,10 @@ class H(BaseHTTPRequestHandler):
             self._send({"n": len(p), "pts": base64.b64encode(p.tobytes()).decode(),
                         "pose": pose, "yaw": nav.heading(yaw), "skipped": skipped, "lost": state["lost"],
                         "explore": explorer.on, "msg": state["msg"], "zones": [z["pts"] for z in explorer.zones],
-                        "target": explorer.target})
+                        "target": explorer.target, "objects": explorer.objects})
         elif self.path == "/state":
             pose, yaw = cur_pose()
-            self._send({"explore": explorer.on, "ai": {"on": bool(explorer.on and explorer.brain), "log": explorer.ai_log[-8:], "n": explorer.ai_n,
+            self._send({"objects": object_pool(), "explore": explorer.on, "ai": {"on": bool(explorer.on and explorer.brain), "log": explorer.ai_log[-8:], "n": explorer.ai_n,
                         "tokens": [explorer.brain.tokens_in, explorer.brain.tokens_out, explorer.brain.tokens_cached] if explorer.brain else [0, 0, 0]},
                         "learn": loc.learn if loc else False,
                         "added": loc.added if loc else 0, "removed": loc.removed if loc else 0,
@@ -1441,6 +1812,59 @@ class H(BaseHTTPRequestHandler):
             save_zones()
             state["path"], state["wp"] = [], 1          # an old path may now cross the zone
             self._send({"ok": True, "zones": zones})
+        elif self.path == "/objects":
+            pool = object_pool()
+            if data.get("action") == "delete":
+                with obj_lock:
+                    pool[:] = [o for o in pool if o["id"] != data.get("id")]
+                if pool is map_objects:
+                    save_objects()
+                return self._send({"ok": True, "objects": pool})
+            why = scan_objects(force=True)
+            self._send({"ok": not why, "error": why, "objects": pool})
+        elif self.path == "/place":
+            if data.get("action") == "delete":
+                places[:] = [p for p in places if p["id"] != data.get("id")]
+                try:
+                    os.remove(place_img_file(data.get("id")))
+                except (OSError, ValueError, TypeError):
+                    pass
+                save_places()
+                return self._send({"ok": True, "places": places})
+            name = str(data.get("name", "")).strip()[:40]
+            if not name:
+                return self._send({"ok": False, "error": "A place needs a name"})
+            desc = str(data.get("description", "")).strip()[:200]
+            instr = str(data.get("instructions", "")).strip()[:500]
+            icon = str(data.get("icon", "")).strip()[:4]
+            if data.get("action") == "update":
+                pl = next((p for p in places if p["id"] == data.get("id")), None)
+                if pl is None:
+                    return self._send({"ok": False, "error": "Unknown place"})
+                if any(p is not pl and p["name"].lower() == name.lower() for p in places):
+                    return self._send({"ok": False, "error": f"There is already a place called {name}"})
+                pl["name"], pl["description"], pl["instructions"], pl["icon"] = name, desc, instr, icon
+                bad = set_place_image(pl, data)
+                if bad:
+                    return self._send({"ok": False, "error": bad})
+                save_places()
+                return self._send({"ok": True, "places": places})
+            if loc is None or loc.mode != "nav" or gm is None:
+                return self._send({"ok": False, "error": "Places need a loaded map (not while mapping)"})
+            if any(p["name"].lower() == name.lower() for p in places):
+                return self._send({"ok": False, "error": f"There is already a place called {name}"})
+            try:
+                x, y = float(data["x"]), float(data["y"])
+            except (KeyError, TypeError, ValueError):
+                return self._send({"ok": False, "error": "Click a point on the map"})
+            cx, cy = gm.to_cell(x, y)
+            if not gm.inside(cx, cy) or gm.grid[cy, cx] != 0 or gm.blocked[cy, cx]:
+                return self._send({"ok": False, "error": "That spot is not known free floor (unknown, wall margin or no-go) - pick a white area"})
+            places.append({"id": max([p["id"] for p in places] + [0]) + 1, "name": name, "description": desc, "instructions": instr, "icon": icon, "img": None,
+                           "x": round(x, 3), "y": round(y, 3), "t": time.strftime("%H:%M:%S %d %b")})
+            bad = set_place_image(places[-1], data)
+            save_places()
+            self._send({"ok": True, "places": places})
         elif self.path == "/photo":
             global photos
             if data.get("action") == "delete":
@@ -1536,6 +1960,8 @@ class H(BaseHTTPRequestHandler):
             if photos and os.path.isdir(old_base + ".photos"):
                 shutil.copytree(old_base + ".photos", photos_base[0] + ".photos", dirs_exist_ok=True)
             save_photos()
+            save_objects()
+            save_places()
             self._send({"ok": True, "file": path})
         elif self.path == "/deletemap":
             f = data.get("file")
@@ -1548,7 +1974,7 @@ class H(BaseHTTPRequestHandler):
             base = os.path.splitext(f)[0]
             trash = f"{MAP_DIR}/trash/{time.strftime('%Y%m%d-%H%M%S')}"     # moved, not erased - recoverable
             os.makedirs(trash, exist_ok=True)
-            for p in (f, base + ".zones.json", base + ".photos.json", base + ".photos"):
+            for p in [f] + glob.glob(glob.escape(base) + ".*"):     # .zones/.photos/.photos.json/.objects/.places...
                 if os.path.exists(p):
                     shutil.move(p, trash)
             log(f"[maps] deleted {f} (moved to {trash})")
@@ -1596,6 +2022,9 @@ class H(BaseHTTPRequestHandler):
                     save_zones()
                 for pin in explorer.pins:         # ...and the photos pinned during the run
                     store_pin(pin, pin["frame"])
+                map_objects[:] = explorer.objects     # ...and the furniture it named
+                photos_base[0] = os.path.splitext(path)[0]
+                save_objects()
                 new = build_gm(path)
                 loc.set_map(path)                 # switches back to navigation
             except Exception as e:
@@ -1603,7 +2032,7 @@ class H(BaseHTTPRequestHandler):
                     os.remove(path)               # no half-saved map blocking a retry
                 return self._send({"ok": False, "error": "Save failed: " + str(e)})
             gm = new
-            explorer.prev_gm, explorer.zones, explorer.pins = None, [], []
+            explorer.prev_gm, explorer.zones, explorer.pins, explorer.objects = None, [], [], []
             state["path"] = []
             current_map[0] = path
             self._send({"ok": True, "file": path})
@@ -1664,7 +2093,7 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
  canvas{max-width:100%;max-height:100%;border-radius:8px;cursor:crosshair;background:#999}
 </style></head><body>
 <header><h1>Robot Navigator</h1><span id="status">Click the map to choose a destination</span>
-<select id="maps" title="Choose map"></select><button id="delmap" title="Delete the selected map" style="background:#3b4252;padding:9px 12px">🗑</button><button id="mode">Mode: Navigate</button><button id="zbtn">No-go zones: off</button><button id="draw">Draw path: off</button><button id="undo" disabled>Undo</button><button id="clear" disabled>Clear</button><button id="go" disabled>Go</button><button id="stop">Stop</button><button id="snap" style="background:#3b4252">📷 Pin photo</button></header>
+<select id="maps" title="Choose map"></select><button id="delmap" title="See all maps and delete the ones you do not need" style="background:#3b4252">🗂 Manage maps</button><button id="mode">Mode: Navigate</button><button id="zbtn">No-go zones: off</button><button id="draw">Draw path: off</button><button id="undo" disabled>Undo</button><button id="clear" disabled>Clear</button><button id="go" disabled>Go</button><button id="stop">Stop</button><button id="snap" style="background:#3b4252">📷 Pin photo</button><button id="placebtn" style="background:#3b4252" title="Click the map to drop a named place the AI can drive to">📍 Pin place: off</button><button id="objscan" style="background:#3b4252" title="Look at the camera view, name the furniture and place it on the map">🔎 Identify objects</button></header>
 <div id="speedbar"><label>Forward <input type="range" id="mv" min="0.1" max="1" step="0.05" value="0.3"><b id="mvv">0.30</b></label>
  <label style="margin-left:auto">Map: <b id="mstat" style="width:auto">–</b></label>
  <button id="learn" style="padding:4px 12px;font-size:13px;background:#2f9e44">Learn changes: on</button>
@@ -1691,6 +2120,16 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <div id="pv" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9;align-items:center;justify-content:center;flex-direction:column;gap:10px">
  <img id="pvimg" style="max-width:90vw;max-height:78vh;border-radius:8px"><div id="pvt" style="color:#9aa4b2"></div>
  <div style="display:flex;gap:10px"><button id="pvdel" style="background:#d64545">Delete pin</button><button id="pvclose" style="background:#3b4252">Close</button></div></div>
+<div id="mm" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9;align-items:center;justify-content:center">
+ <div style="background:#2e3440;padding:16px;border-radius:8px;display:flex;flex-direction:column;gap:8px;min-width:320px;max-width:90vw;max-height:80vh">
+  <div style="color:#9aa4b2">Saved maps (deleted maps go to maps/trash, not erased)</div><div id="mmlist" style="overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+  <button id="mmclose" style="background:#3b4252">Close</button></div></div>
+<div id="plm" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9;align-items:center;justify-content:center">
+ <div style="background:#2e3440;padding:16px;border-radius:8px;display:flex;flex-direction:column;gap:8px;min-width:280px">
+  <div style="color:#9aa4b2">Edit place</div><input id="plname" placeholder="name" maxlength="40"><input id="pldesc" placeholder="description" maxlength="200"><div style="display:flex;gap:6px;align-items:center"><input id="plicon" placeholder="icon" maxlength="4" style="width:60px;text-align:center;font-size:20px"><span id="plpal" style="display:flex;flex-wrap:wrap;gap:2px"></span></div>
+  <div style="display:flex;gap:8px;align-items:center"><img id="plthumb" style="display:none;width:56px;height:56px;object-fit:cover;border-radius:50%"><input id="plfile" type="file" accept="image/*" style="max-width:190px"><button id="plnoimg" type="button" style="background:#3b4252">Remove picture</button></div>
+  <textarea id="plinstr" rows="4" maxlength="500" placeholder="Instructions for the AI at this pin, e.g. take a photo, turn slowly all round, then finish" style="padding:8px;border-radius:6px;border:0"></textarea>
+  <div style="display:flex;gap:10px"><button id="plsave">Save</button><button id="pldel" style="background:#d64545">Delete pin</button><button id="plclose" style="background:#3b4252">Cancel</button></div></div></div>
 <script>
 {const im=document.getElementById('cam');im.onload=()=>im.style.display='block';im.onerror=()=>im.style.display='none';im.src='/video';}
 const S=4, cv=document.getElementById('c'), ctx=cv.getContext('2d');
@@ -1752,6 +2191,34 @@ function drawPhotos(){photos.forEach(p=>{const q=w2p(p.x,p.y);
   ctx.arc(q[0],q[1],34,-p.yaw-.45,-p.yaw+.45);ctx.closePath();ctx.fill();      // the way the camera was facing
   ctx.fillStyle='#fab005';ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(q[0],q[1],9,0,7);ctx.fill();ctx.stroke();
   ctx.fillStyle='#000';ctx.font='bold 10px sans-serif';ctx.textAlign='center';ctx.fillText('📷',q[0],q[1]+4)})}
+let places=[], placeMode=false;
+const placeBtn=document.getElementById('placebtn');
+async function loadPlaces(){places=(await (await fetch('/places')).json()).places;draw()}
+placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.textContent='📍 Pin place: '+(placeMode?'ON - click the map':'off');placeBtn.style.background=placeMode?'#2f9e44':'#3b4252';
+  if(placeMode)flash('Click a white (free) spot on the map to name it')};
+function drawPlaces(){places.forEach(p=>{const q=w2p(p.x,p.y),im=placeImg(p),R=im?15:p.icon?13:8;
+  ctx.fillStyle='#e8590c';ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(q[0],q[1],R,0,7);ctx.fill();
+  if(im){ctx.save();ctx.clip();const m=Math.min(im.naturalWidth,im.naturalHeight);ctx.drawImage(im,(im.naturalWidth-m)/2,(im.naturalHeight-m)/2,m,m,q[0]-R,q[1]-R,2*R,2*R);ctx.restore()}
+  ctx.beginPath();ctx.arc(q[0],q[1],R,0,7);ctx.stroke();
+  if(!im&&p.icon){ctx.font='16px sans-serif';ctx.textAlign='center';ctx.fillStyle='#fff';ctx.fillText(p.icon,q[0],q[1]+6)}
+  ctx.font='bold 12px sans-serif';ctx.textAlign='center';ctx.lineWidth=3;ctx.strokeStyle='#000';ctx.strokeText(p.name,q[0],q[1]-R-6);ctx.fillStyle='#ffd8a8';ctx.fillText(p.name,q[0],q[1]-R-6)})}
+async function placeClick(e,b){
+  const cx=(e.clientX-b.left)/b.width*cv.width, cy=(e.clientY-b.top)/b.height*cv.height;
+  const hit=places.find(p=>{const q=w2p(p.x,p.y);return Math.hypot(q[0]-cx,q[1]-cy)<20});
+  if(hit){plId=hit.id;plname.value=hit.name;pldesc.value=hit.description||'';plinstr.value=hit.instructions||'';plicon.value=hit.icon||'';plImg=undefined;plfile.value='';showThumb(hit);plm.style.display='flex';plname.focus();return}
+  if(!placeMode)return false;
+  const w=p2w(cx,cy);const nm=prompt('Name this place (e.g. kitchen, charging dock):');if(!nm||!nm.trim())return;
+  const ds=prompt('Description (optional):','')||'';const ins=prompt('Instructions for the AI at this pin (optional), e.g. take a photo then turn all round:','')||'';
+  const r=await post('/place',{name:nm,description:ds,instructions:ins,x:w[0],y:w[1]});if(!r.ok)return flash(r.error);
+  places=r.places;flash('Pinned "'+nm.trim()+'"');draw()}
+let objs=[];
+const ICONS={bed:'🛏️',chair:'🪑','office chair':'💺',desk:'🖥️',table:'🍽️',sofa:'🛋️',couch:'🛋️',tv:'📺',stairs:'🪜',door:'🚪',window:'🪟',plant:'🪴',
+  bookshelf:'📚',shelf:'📚',wardrobe:'🚪',cabinet:'🗄️',fridge:'🧊',sink:'🚰',toilet:'🚽',lamp:'💡',bin:'🗑️',monitor:'🖥️',laptop:'💻',box:'📦',rug:'🟫',stool:'🪑',bench:'🪑',piano:'🎹'};
+function drawObjects(P){objs.forEach(o=>{const q=P(o.x,o.y);
+  ctx.font='22px sans-serif';ctx.textAlign='center';ctx.fillStyle='#000';ctx.fillText(ICONS[o.label]||'📍',q[0],q[1]+7);
+  ctx.font='bold 11px sans-serif';ctx.lineWidth=3;ctx.strokeStyle='#000';ctx.strokeText(o.label,q[0],q[1]+24);ctx.fillStyle='#fff';ctx.fillText(o.label,q[0],q[1]+24)})}
+document.getElementById('objscan').onclick=async()=>{const r=await post('/objects',{});objs=r.objects||objs;
+  flash(r.ok?'Identifying objects in the camera view… they appear on the map in a few seconds':r.error);draw()};
 let zoneMode=false, zones=[], zpts=[], ztool='box', zbox=null;
 const zbar=document.getElementById('zbar'), zbtn=document.getElementById('zbtn');
 async function loadZones(){zones=(await (await fetch('/zones')).json()).zones;renderZones()}
@@ -1820,29 +2287,31 @@ async function loadMapList(){
   const r=await (await fetch('/maps')).json();
   mapSel.innerHTML=r.maps.map(m=>`<option value="${m}"${m===r.current?' selected':''}>${m.replace(/^maps\//,'').replace(/\.pcd$/,'')}</option>`).join('');
 }
-document.getElementById('delmap').onclick=async()=>{
-  if(moving||mapping)return flash('Stop first');
-  const f=mapSel.value,name=f.replace(/^maps\//,'').replace(/\.pcd$/,'');
-  const cur=(await (await fetch('/maps')).json()).current;
-  if(f===cur)return flash('That map is loaded - switch to another map first');
-  if(!confirm('Delete map "'+name+'" with its zones and photo pins?\n(It is moved to maps/trash, not erased.)'))return;
-  const r=await post('/deletemap',{file:f});
-  if(!r.ok)return flash(r.error);
-  await loadMapList();flash('Deleted "'+name+'"');
-};
+const mm=document.getElementById('mm'),mmlist=document.getElementById('mmlist');
+const mapName=f=>f.replace(/^maps\//,'').replace(/\.pcd$/,'');
+async function renderManage(){
+  const r=await (await fetch('/maps')).json();
+  mmlist.innerHTML=r.maps.map(m=>`<div style="display:flex;gap:10px;align-items:center;justify-content:space-between"><span>${mapName(m)}${m===r.current?' <i style="color:#69db7c">(loaded)</i>':''}</span>`+
+    `<button data-f="${m}" ${m===r.current?'disabled title="Switch to another map first"':''} style="background:#d64545">Delete</button></div>`).join('')||'No maps';
+  mmlist.querySelectorAll('button[data-f]').forEach(bt=>bt.onclick=async()=>{
+    const f=bt.dataset.f;if(!confirm('Delete map "'+mapName(f)+'" with its zones, places, objects and photo pins?'))return;
+    const d=await post('/deletemap',{file:f});if(!d.ok)return flash(d.error);
+    flash('Deleted "'+mapName(f)+'"');await renderManage();await loadMapList()})}
+document.getElementById('delmap').onclick=async()=>{await renderManage();mm.style.display='flex'};
+document.getElementById('mmclose').onclick=()=>{mm.style.display='none'};
 mapSel.onchange=async()=>{
   if(moving){await loadMapList();return}
   st.textContent='Loading map…';
   const r=await post('/selectmap',{file:mapSel.value});
   if(!r.ok){st.textContent=r.error;await loadMapList();return}
   path=[];goal=[];goal=null;pts=[];bad=[];undo.disabled=clear.disabled=go.disabled=true;
-  await loadMap();await loadZones();await loadPhotos();
+  await loadMap();await loadZones();await loadPhotos();await loadPlaces();
   st.textContent='Map loaded — put the car at its origin (where that map was started), then click a destination';
 };
-async function init(){await loadMapList();await loadMap();await loadZones();await loadPhotos(); setInterval(poll,300); setInterval(pollMap,700);setInterval(pollSpeed,1500);pollSpeed();}
+async function init(){await loadMapList();await loadMap();await loadZones();await loadPhotos();await loadPlaces(); setInterval(poll,300); setInterval(pollMap,700);setInterval(pollSpeed,1500);pollSpeed();}
 function draw(){
   if(mapping)return drawMapping();
-  drawBase();drawZones();drawPhotos();drawRest();
+  drawBase();drawZones();drawPhotos();drawPlaces();drawObjects(w2p);drawRest();
 }
 function drawBase(){
   ctx.imageSmoothingEnabled=false; ctx.drawImage(base,0,0,cv.width,cv.height);
@@ -1877,13 +2346,14 @@ function drawMapping(){
   mzones.forEach(z=>{ctx.beginPath();z.forEach((q,i)=>{const w=P(...q);i?ctx.lineTo(...w):ctx.moveTo(...w)});ctx.closePath();
     ctx.fillStyle='rgba(250,60,60,.38)';ctx.fill();ctx.strokeStyle='#ff6b6b';ctx.lineWidth=2;ctx.stroke()});
   if(mtarget){const q=P(...mtarget);ctx.strokeStyle='#ffd43b';ctx.lineWidth=2;ctx.beginPath();ctx.arc(q[0],q[1],9,0,7);ctx.stroke()}
+  drawObjects(P);
   drawCar(...P(...mpose),myaw);
 }
 async function pollMap(){
   if(!mapping)return;
   const s=await (await fetch('/mappts')).json();
   mpts=new Float32Array(Uint8Array.from(atob(s.pts),c=>c.charCodeAt(0)).buffer);
-  mpose=s.pose;myaw=s.yaw;mzones=s.zones||[];mtarget=s.target;
+  mpose=s.pose;myaw=s.yaw;mzones=s.zones||[];mtarget=s.target;objs=s.objects||[];
   if(!mapping||Date.now()<flashUntil)return;
   if(s.explore||/xplor/.test(s.msg||''))st.textContent=s.msg;else
   st.textContent='Mapping — '+(mpts.length/2)+' pts'+(s.skipped?', '+s.skipped+' scans skipped (drive slower)':'');
@@ -1964,7 +2434,7 @@ document.getElementById('savebtn').onclick=async()=>{
 };
 async function poll(){
   const s=await (await fetch('/state')).json();
-  learnOn=s.learn;showLearn();
+  learnOn=s.learn;showLearn();if(!mapping)objs=s.objects||[];
   document.getElementById('mstat').textContent='+'+s.added+' / −'+s.removed+' pts';
   if(s.map_version!==lastVer&&!mapping){const first=lastVer<0;lastVer=s.map_version;if(!first)loadMap()}
   aiOn=!!(s.ai&&s.ai.on);aiBtn.textContent=aiOn?'■ Stop AI':'🧠 AI';aiBtn.style.background=aiOn?'#d64545':'#7048e8';
@@ -1982,7 +2452,10 @@ cv.addEventListener('click',async e=>{
   if(moving||mapping)return;
   const b=cv.getBoundingClientRect();
   if(!zoneMode&&!drawMode&&M){const cx=(e.clientX-b.left)/b.width*cv.width,cy=(e.clientY-b.top)/b.height*cv.height;
-    const hit=photos.find(p=>{const q=w2p(p.x,p.y);return Math.hypot(q[0]-cx,q[1]-cy)<14});if(hit)return showPhoto(hit)}
+    if(placeMode||places.some(p=>{const q=w2p(p.x,p.y);return Math.hypot(q[0]-cx,q[1]-cy)<20})){if(await placeClick(e,b)!==false)return}
+    const hit=photos.find(p=>{const q=w2p(p.x,p.y);return Math.hypot(q[0]-cx,q[1]-cy)<14});if(hit)return showPhoto(hit);
+    const ob=objs.find(o=>{const q=w2p(o.x,o.y);return Math.hypot(q[0]-cx,q[1]-cy)<16});
+    if(ob){if(confirm('Remove "'+ob.label+'" from the map?')){const r=await post('/objects',{action:'delete',id:ob.id});objs=r.objects;draw()}return}}
   if(zoneMode){if(ztool!=='poly')return;zpts.push(p2w((e.clientX-b.left)/b.width*cv.width,(e.clientY-b.top)/b.height*cv.height));return draw()}
   if(drawMode){
     pts.push(p2w((e.clientX-b.left)/b.width*cv.width,(e.clientY-b.top)/b.height*cv.height));

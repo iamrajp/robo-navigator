@@ -1,7 +1,7 @@
 """LLM 'brain': looks at the map image + camera frame and picks the robot's next high-level action.
 
 The LLM never drives. It returns ONE tool call per decision (explore_to / go_to / turn_to /
-pin_photo / add_no_go / finish); nav_server validates it and runs it through the normal planner,
+pin_photo / finish); nav_server validates it and runs it through the normal planner,
 no-go zones, obstacle detours, stuck handling and ledge check."""
 import base64
 import io
@@ -19,6 +19,10 @@ MODEL = os.environ.get("LLM_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("LLM_EFFORT", "low")
 MAX_DECISIONS = int(os.environ.get("LLM_MAX_DECISIONS", "60"))
 API_TIMEOUT = 60.0
+SKILLS = os.environ.get("LLM_SKILLS", "full")            # full | mid | primitive  (what the LLM may call)
+MEMORY = os.environ.get("LLM_MEMORY") == "1"             # carry lessons from earlier runs into the prompt
+LESSONS_FILE = os.environ.get("LESSONS_FILE", "lessons.json")
+MAX_LESSONS = 12
 HISTORY_LINES = 10
 
 SYSTEM = """You are the navigation brain of a small wheeled indoor robot (about 30 cm wide) with a 2D LiDAR and a low, forward-facing camera mounted near the floor.
@@ -26,13 +30,14 @@ Each turn you get: the user's task, a top-down map image, the latest camera fram
 
 Map image: white = floor the LiDAR has seen free, dark gray = never seen (unknown), black = walls/obstacles, light gray = keep-out margin around obstacles, red = no-go boxes, yellow numbered discs = photo pins, blue dots = where the robot has been, the blue arrow = the robot (pointing the way it faces), green discs labelled F1, F2... = frontiers (reachable edges of unexplored space). Faint grid lines and the axis labels are in metres. World coordinates: +x to the right, +y UP in the image.
 
-The robot's low camera and 2D LiDAR cannot see drops. STAIRS, STEPS DOWN OR LEDGES ARE THE BIGGEST DANGER: if the camera shows stairs, a step, a balcony edge, or the floor seems to end, call add_no_go with a box covering the area in front of the robot before doing anything else, and do not drive toward it. Also avoid spots where the floor looks unlike the floor behind you.
+The robot's low camera and 2D LiDAR cannot see drops. STAIRS, STEPS DOWN OR LEDGES ARE THE BIGGEST DANGER: if the camera shows stairs, a step, a balcony edge, or the floor seems to end, do not drive toward it: turn away and choose another route (you cannot create no-go boxes; the owner's boxes and the robot's own ledge check do that, and you must respect every red box). Also avoid spots where the floor looks unlike the floor behind you.
 
 Rules:
 - Obey the user's task. Prefer finishing nearby areas before long transits. Do not go back to places already covered.
 - explore_to(frontier_id) is the main way to explore; go_to(x, y) only to already-seen free floor.
 - Each move is short (at most about 1.5 m); you will be asked again.
 - Use pin_photo (once per room or notable spot) with a short note naming it, e.g. "kitchen door".
+- If the task names a place the owner has pinned (see "Named places" in the status), call go_to_place(name) repeatedly until it says arrived. If the arrival message (or the place's [on arrival] note) carries owner instructions, carry them out with your other tools before finishing; otherwise just finish.
 - Use turn_to to look around when the camera view is unhelpful.
 - Call finish when the task is done or nothing useful is left (e.g. no frontiers).
 - Give a "reason" of at most 25 words with every call. Be decisive; do not ask questions."""
@@ -50,13 +55,48 @@ TOOLS = [
     {"name": "pin_photo", "description": "Save the current camera frame as a labelled photo pin at the robot's position.",
      "input_schema": {"type": "object", "properties": {"note": {"type": "string"}, "reason": {"type": "string"}},
                       "required": ["note", "reason"], "additionalProperties": False}},
-    {"name": "add_no_go", "description": "Mark an axis-aligned no-go box (centre x,y and size w,h in metres, max 3 m each) the robot must never enter, e.g. stairs. Cannot be removed by you.",
-     "input_schema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"},
-                                                       "h": {"type": "number"}, "reason": {"type": "string"}},
-                      "required": ["x", "y", "w", "h", "reason"], "additionalProperties": False}},
+    {"name": "go_to_place", "description": "Drive one short leg toward a named place the owner pinned on the map (see 'Named places' in the status). Repeat until the result says arrived.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "reason": {"type": "string"}},
+                      "required": ["name", "reason"], "additionalProperties": False}},
+    {"name": "drive_forward", "description": "Drive straight ahead by 0.05-0.5 m (stops early at a wall, no-go box or ledge).",
+     "input_schema": {"type": "object", "properties": {"meters": {"type": "number"}, "reason": {"type": "string"}},
+                      "required": ["meters", "reason"], "additionalProperties": False}},
+    {"name": "drive_back", "description": "Reverse by 0.05-0.5 m while the way behind is clear.",
+     "input_schema": {"type": "object", "properties": {"meters": {"type": "number"}, "reason": {"type": "string"}},
+                      "required": ["meters", "reason"], "additionalProperties": False}},
+    {"name": "push_object", "description": "Push a floor object (e.g. 'ball') to a map point. The robot finds it with the camera, lines up behind it, pushes in short steps and re-checks. Returns ok / partial / error with how far the object is from the target. The target must be seen free floor.",
+     "input_schema": {"type": "object", "properties": {"label": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "reason": {"type": "string"}},
+                      "required": ["label", "x", "y", "reason"], "additionalProperties": False}},
     {"name": "finish", "description": "End the run: the task is complete or there is nothing useful left.",
      "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"], "additionalProperties": False}},
 ]
+
+
+_BASE = {"turn_to", "pin_photo", "finish"}
+LEVEL_TOOLS = {"full": _BASE | {"explore_to", "go_to", "push_object", "go_to_place"},
+               "mid": _BASE | {"explore_to", "go_to", "drive_forward", "drive_back", "go_to_place"},
+               "primitive": _BASE | {"drive_forward", "drive_back"}}
+LEVEL_NOTES = {
+    "full": "\nSkills: to move an object use push_object(label, x, y) - it does the lining-up and pushing itself; check its result text and call it again if the result is 'partial'.",
+    "mid": "\nSkills: you have no push tool. To push an object, drive_forward into it from behind so that it rolls toward the goal; stand on the line from the goal through the object, face the goal with turn_to, then use short drive_forward steps and look at the camera between steps.",
+    "primitive": "\nSkills: you can only turn_to, drive_forward and drive_back (plus pin_photo, finish). Work out yourself how to move an object: stand behind it on the line to the goal, face the goal, and drive forward in short steps, checking the camera.",
+}
+
+
+def allowed_tools():
+    return LEVEL_TOOLS.get(SKILLS, LEVEL_TOOLS["full"])
+
+
+def load_lessons():
+    try:
+        return [str(x) for x in json.load(open(LESSONS_FILE))][-MAX_LESSONS:]
+    except (OSError, ValueError):
+        return []
+
+
+def save_lesson(text):
+    lessons = load_lessons() + [text.strip()[:300]]
+    json.dump(lessons[-MAX_LESSONS:], open(LESSONS_FILE, "w"), indent=1)
 
 
 class BrainError(RuntimeError):
@@ -132,14 +172,15 @@ class Brain:
         self.decisions = 0
         self.tokens_in = self.tokens_out = self.tokens_cached = 0
         self.use_fallbacks = True
+        self.lessons = load_lessons() if MEMORY else []
 
     def note_result(self, line):
         self.history.append(line)
         del self.history[:-HISTORY_LINES]
 
-    def _call(self, content):
-        kw = dict(model=MODEL, max_tokens=4000, system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                  tools=TOOLS, tool_choice={"type": "auto"}, messages=[{"role": "user", "content": content}],
+    def _call(self, content, allowed):
+        kw = dict(model=MODEL, max_tokens=4000, system=[{"type": "text", "text": SYSTEM + LEVEL_NOTES.get(SKILLS, ""), "cache_control": {"type": "ephemeral"}}],
+                  tools=[t for t in TOOLS if t["name"] in allowed], tool_choice={"type": "auto"}, messages=[{"role": "user", "content": content}],
                   output_config={"effort": EFFORT})
         if self.use_fallbacks:
             try:
@@ -155,6 +196,8 @@ class Brain:
         if self.decisions >= MAX_DECISIONS:
             raise DecisionLimit(f"decision limit ({MAX_DECISIONS}) reached")
         content = [{"type": "text", "text": "TASK: " + (task or "Explore and map everything reachable.")}]
+        if self.lessons:
+            content.append({"type": "text", "text": "LESSONS FROM YOUR EARLIER RUNS (apply them):\n- " + "\n- ".join(self.lessons)})
         if self.history:
             content.append({"type": "text", "text": "RECENT ACTIONS (oldest first):\n" + "\n".join(self.history)})
         content.append({"type": "text", "text": "Map:"})
@@ -167,7 +210,7 @@ class Brain:
         content.append({"type": "text", "text": status + "\nAllowed tools this turn: " + ", ".join(sorted(allowed)) +
                         ".\nCall exactly one tool."})
         try:
-            resp = self._call(content)
+            resp = self._call(content, allowed)
         except self.anthropic.APIError as e:
             raise BrainError(f"{type(e).__name__}: {e}") from e
         self.decisions += 1
@@ -186,6 +229,31 @@ class Brain:
         self.log(f"[ai] #{self.decisions} {call.name} {json.dumps(args)[:160]} "
                  f"(in={u.input_tokens} out={u.output_tokens} cached={getattr(u, 'cache_read_input_tokens', 0) or 0})")
         return call.name, args
+
+
+REFLECT_PROMPT = ("You just finished a run as a small wheeled robot. Task: {task}\nYour actions and their results:\n{log}\nHow it ended: {end}\n"
+                  "Write ONE short, concrete lesson (max 40 words) that would make the next attempt at a similar task faster or more reliable "
+                  "(e.g. a better order of steps, a distance to keep, what a failure message really meant). If nothing useful was learned reply with exactly NONE.")
+
+
+def reflect(task, log_lines, end, log=print):
+    """One LLM call after a run -> stores a lesson in LESSONS_FILE (only when LLM_MEMORY=1). Returns the lesson or ''."""
+    if not MEMORY or not log_lines:
+        return ""
+    import anthropic
+    try:
+        resp = anthropic.Anthropic(timeout=API_TIMEOUT, max_retries=1).messages.create(
+            model=MODEL, max_tokens=300,
+            messages=[{"role": "user", "content": REFLECT_PROMPT.format(task=task, log="\n".join(log_lines[-25:]), end=end)}])
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except anthropic.APIError as e:
+        log(f"[ai] reflection failed: {e}")
+        return ""
+    if not text or text.upper().startswith("NONE"):
+        return ""
+    save_lesson(text)
+    log(f"[ai] lesson saved: {text}")
+    return text
 
 
 # ── chat ─────────────────────────────────────────────────────────────────────
